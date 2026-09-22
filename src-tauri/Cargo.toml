@@ -1,0 +1,20 @@
+[package]
+name = "shepherd"
+version = "0.1.0"
+description = "A multi-canvas story flow editor"
+authors = ["Shepherd contributors"]
+edition = "2021"
+
+[lib]
+name = "shepherd_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tempfile = "3"

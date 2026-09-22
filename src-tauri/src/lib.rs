@@ -1,0 +1,197 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+#[tauri::command]
+fn read_project_file(path: String) -> Result<String, String> {
+    fs::read_to_string(PathBuf::from(path)).map_err(|error| error.to_string())
+}
+
+fn backup_path(destination: &Path, generation: u8) -> PathBuf {
+    let mut name = destination.as_os_str().to_os_string();
+    name.push(format!(".backup{generation}"));
+    PathBuf::from(name)
+}
+
+fn rotate_backups(destination: &Path) -> Result<(), String> {
+    let oldest = backup_path(destination, 3);
+    if oldest.exists() {
+        fs::remove_file(&oldest).map_err(|error| error.to_string())?;
+    }
+    for generation in (1..3).rev() {
+        let source = backup_path(destination, generation);
+        if source.exists() {
+            fs::rename(&source, backup_path(destination, generation + 1))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if destination.exists() {
+        fs::copy(destination, backup_path(destination, 1)).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn write_project_file_atomic(
+    path: String,
+    contents: String,
+    create_backup: bool,
+) -> Result<(), String> {
+    let destination = PathBuf::from(path);
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    if !parent.is_dir() {
+        return Err("The destination directory does not exist.".to_string());
+    }
+
+    if create_backup {
+        rotate_backups(&destination)?;
+    }
+
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".shepherd-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+
+    temporary
+        .write_all(contents.as_bytes())
+        .and_then(|_| temporary.flush())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error.to_string())?;
+
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn write_binary_file_atomic(path: String, base64_data: String) -> Result<(), String> {
+    let bytes = STANDARD
+        .decode(base64_data)
+        .map_err(|error| error.to_string())?;
+    let destination = PathBuf::from(path);
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err("The destination directory does not exist.".to_string());
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".shepherd-export-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.flush())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error.to_string())?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            read_project_file,
+            write_project_file_atomic,
+            write_binary_file_atomic
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Shepherd");
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    use super::{
+        backup_path, read_project_file, write_binary_file_atomic, write_project_file_atomic,
+    };
+
+    #[test]
+    fn atomic_write_replaces_an_existing_project() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let destination = directory.path().join("project.storyflow");
+        std::fs::write(&destination, "old").expect("write initial file");
+
+        write_project_file_atomic(
+            destination.to_string_lossy().into_owned(),
+            "new project".to_string(),
+            true,
+        )
+        .expect("replace project");
+
+        let contents =
+            read_project_file(destination.to_string_lossy().into_owned()).expect("read project");
+        assert_eq!(contents, "new project");
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&destination, 1)).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn backups_are_rotated_to_three_generations() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let destination = directory.path().join("project.storyflow");
+        for version in 0..5 {
+            write_project_file_atomic(
+                destination.to_string_lossy().into_owned(),
+                format!("version {version}"),
+                true,
+            )
+            .expect("write project");
+        }
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&destination, 1)).unwrap(),
+            "version 3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&destination, 2)).unwrap(),
+            "version 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&destination, 3)).unwrap(),
+            "version 1"
+        );
+    }
+
+    #[test]
+    fn atomic_binary_write_decodes_base64() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let destination = directory.path().join("canvas.png");
+        let bytes = [0_u8, 1, 2, 127, 255];
+
+        write_binary_file_atomic(
+            destination.to_string_lossy().into_owned(),
+            STANDARD.encode(bytes),
+        )
+        .expect("write binary file");
+
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+    }
+}
