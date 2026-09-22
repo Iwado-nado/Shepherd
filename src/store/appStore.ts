@@ -52,6 +52,7 @@ export interface NavigationLocation {
 }
 
 export type SaveState = "idle" | "saving" | "error";
+export type AutosaveState = "idle" | "saving" | "error";
 export type SearchMode = "canvas" | "project" | null;
 export type FilterBehavior = "dim" | "hide";
 export type TagFilterMode = "any" | "all";
@@ -66,11 +67,16 @@ interface AppState {
   saveState: SaveState;
   lastError: string | null;
   autoSavePaused: boolean;
+  autosaveState: AutosaveState;
+  autosavedRevision: number | null;
+  autosavedWorkspaceRevision: number | null;
+  lastAutosavedAt: string | null;
   past: HistoryEntry[];
   future: HistoryEntry[];
   currentRevision: number;
   savedRevision: number | null;
   nextRevision: number;
+  workspaceRevision: number;
   canvasSize: { width: number; height: number };
   viewportNonce: number;
   searchMode: SearchMode;
@@ -85,8 +91,11 @@ interface AppState {
 
   newProject: (title?: string) => void;
   loadProject: (projectFile: ProjectFile, path: string) => void;
-  markSaved: (path: string, revision: number) => void;
+  restoreProject: (projectFile: ProjectFile, path: string | null) => void;
+  markSaved: (path: string, revision: number, workspaceRevision: number) => void;
+  markAutosaved: (projectId: string, revision: number, workspaceRevision: number, autosavedAt: string) => void;
   setSaveState: (state: SaveState, error?: string | null) => void;
+  setAutosaveState: (state: AutosaveState, error?: string | null) => void;
   setAutoSavePaused: (paused: boolean) => void;
   setCanvasSize: (width: number, height: number) => void;
   setSelection: (selection: Selection) => void;
@@ -272,6 +281,7 @@ export const useAppStore = create<AppState>((set, get) => {
       },
       selection,
       workspaceDirty: true,
+      workspaceRevision: state.workspaceRevision + 1,
       viewportNonce: state.viewportNonce + 1,
       searchMode: null,
       navigationBack: [...state.navigationBack, origin].slice(-NAVIGATION_LIMIT),
@@ -289,11 +299,16 @@ export const useAppStore = create<AppState>((set, get) => {
     saveState: "idle",
     lastError: null,
     autoSavePaused: false,
+    autosaveState: "idle",
+    autosavedRevision: null,
+    autosavedWorkspaceRevision: null,
+    lastAutosavedAt: null,
     past: [],
     future: [],
     currentRevision: 0,
     savedRevision: null,
     nextRevision: 1,
+    workspaceRevision: 0,
     canvasSize: { width: 800, height: 600 },
     viewportNonce: 0,
     searchMode: null,
@@ -316,11 +331,16 @@ export const useAppStore = create<AppState>((set, get) => {
       saveState: "idle",
       lastError: null,
       autoSavePaused: false,
+      autosaveState: "idle",
+      autosavedRevision: null,
+      autosavedWorkspaceRevision: null,
+      lastAutosavedAt: null,
       past: [],
       future: [],
       currentRevision: 0,
       savedRevision: null,
       nextRevision: 1,
+      workspaceRevision: 0,
       viewportNonce: 0,
       searchMode: null,
       searchQuery: "",
@@ -343,11 +363,16 @@ export const useAppStore = create<AppState>((set, get) => {
       saveState: "idle",
       lastError: null,
       autoSavePaused: false,
+      autosaveState: "idle",
+      autosavedRevision: null,
+      autosavedWorkspaceRevision: null,
+      lastAutosavedAt: null,
       past: [],
       future: [],
       currentRevision: 0,
       savedRevision: 0,
       nextRevision: 1,
+      workspaceRevision: 0,
       viewportNonce: 0,
       searchMode: null,
       searchQuery: "",
@@ -360,19 +385,65 @@ export const useAppStore = create<AppState>((set, get) => {
       navigationForward: [],
     }),
 
-    markSaved: (path, revision) => {
+    restoreProject: (projectFile, path) => {
+      const state = get();
+      const revision = state.nextRevision;
+      set({
+        projectFile,
+        currentFilePath: path,
+        selection: null,
+        clipboard: null,
+        contentDirty: true,
+        workspaceDirty: true,
+        saveState: "idle",
+        lastError: null,
+        autosaveState: "idle",
+        autosavedRevision: null,
+        autosavedWorkspaceRevision: null,
+        lastAutosavedAt: null,
+        past: [],
+        future: [],
+        currentRevision: revision,
+        savedRevision: null,
+        nextRevision: revision + 1,
+        workspaceRevision: state.workspaceRevision + 1,
+        viewportNonce: state.viewportNonce + 1,
+        searchMode: null,
+        searchQuery: "",
+        navigationBack: [],
+        navigationForward: [],
+      });
+    },
+
+    markSaved: (path, revision, workspaceRevision) => {
       const state = get();
       set({
         currentFilePath: path,
         savedRevision: revision,
         contentDirty: state.currentRevision !== revision,
-        workspaceDirty: false,
+        workspaceDirty: state.workspaceRevision !== workspaceRevision,
         saveState: "idle",
+        lastError: null,
+        autosaveState: "idle",
+        autosavedRevision: null,
+        autosavedWorkspaceRevision: null,
+        lastAutosavedAt: null,
+      });
+    },
+
+    markAutosaved: (projectId, revision, workspaceRevision, autosavedAt) => {
+      if (get().projectFile.project.id !== projectId) return;
+      set({
+        autosavedRevision: revision,
+        autosavedWorkspaceRevision: workspaceRevision,
+        lastAutosavedAt: autosavedAt,
+        autosaveState: "idle",
         lastError: null,
       });
     },
 
     setSaveState: (saveState, error = null) => set({ saveState, lastError: error }),
+    setAutosaveState: (autosaveState, error = null) => set({ autosaveState, lastError: error }),
     setAutoSavePaused: (autoSavePaused) => set({ autoSavePaused }),
     setCanvasSize: (width, height) => set({ canvasSize: { width, height } }),
     setSelection: (selection) => {
@@ -401,6 +472,7 @@ export const useAppStore = create<AppState>((set, get) => {
           projectFile: { ...state.projectFile, workspace: { lastOpenedCanvasId: canvas.id } },
           selection: null,
           workspaceDirty: true,
+          workspaceRevision: state.workspaceRevision + 1,
           viewportNonce: state.viewportNonce + 1,
           navigationBack: [...state.navigationBack, origin].slice(-NAVIGATION_LIMIT),
           navigationForward: [],
@@ -451,6 +523,7 @@ export const useAppStore = create<AppState>((set, get) => {
           projectFile: { ...next.projectFile, workspace: { lastOpenedCanvasId: duplicateId } },
           selection: null,
           workspaceDirty: true,
+          workspaceRevision: next.workspaceRevision + 1,
           viewportNonce: next.viewportNonce + 1,
           navigationBack: [...next.navigationBack, origin].slice(-NAVIGATION_LIMIT),
           navigationForward: [],
@@ -501,6 +574,7 @@ export const useAppStore = create<AppState>((set, get) => {
           },
           selection: null,
           workspaceDirty: true,
+          workspaceRevision: nextState.workspaceRevision + 1,
           viewportNonce: nextState.viewportNonce + 1,
           navigationBack,
           navigationForward,
@@ -521,6 +595,7 @@ export const useAppStore = create<AppState>((set, get) => {
         projectFile: { ...state.projectFile, workspace: { lastOpenedCanvasId: canvasId } },
         selection: null,
         workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
         viewportNonce: state.viewportNonce + 1,
         navigationBack: [...state.navigationBack, origin].slice(-NAVIGATION_LIMIT),
         navigationForward: [],
@@ -535,7 +610,11 @@ export const useAppStore = create<AppState>((set, get) => {
         const canvas = draft.canvases.find((item) => item.id === canvasId);
         if (canvas) canvas.viewport = viewport;
       });
-      set({ projectFile: { ...state.projectFile, project }, workspaceDirty: true });
+      set({
+        projectFile: { ...state.projectFile, project },
+        workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
+      });
     },
 
     setDisplayMode: (mode) => {
@@ -831,6 +910,7 @@ export const useAppStore = create<AppState>((set, get) => {
         projectFile: { ...state.projectFile, project, workspace: { lastOpenedCanvasId: start.canvasId } },
         selection: { type: "placements", ids: [start.placementId] },
         workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
         viewportNonce: state.viewportNonce + 1,
         navigationBack: [...state.navigationBack, origin].slice(-NAVIGATION_LIMIT),
         navigationForward: [],
@@ -890,6 +970,7 @@ export const useAppStore = create<AppState>((set, get) => {
         navigationBack: [...state.navigationBack, origin].slice(-NAVIGATION_LIMIT),
         navigationForward: [],
         workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
         viewportNonce: state.viewportNonce + 1,
       });
     },
@@ -909,6 +990,7 @@ export const useAppStore = create<AppState>((set, get) => {
         navigationBack: state.navigationBack.slice(0, -1),
         navigationForward: [current, ...state.navigationForward].slice(0, NAVIGATION_LIMIT),
         workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
         viewportNonce: state.viewportNonce + 1,
       });
     },
@@ -928,6 +1010,7 @@ export const useAppStore = create<AppState>((set, get) => {
         navigationBack: [...state.navigationBack, current].slice(-NAVIGATION_LIMIT),
         navigationForward: forward,
         workspaceDirty: true,
+        workspaceRevision: state.workspaceRevision + 1,
         viewportNonce: state.viewportNonce + 1,
       });
     },
@@ -1053,6 +1136,9 @@ export const useAppStore = create<AppState>((set, get) => {
         currentRevision: entry.beforeRevision,
         contentDirty: state.savedRevision !== entry.beforeRevision,
         workspaceDirty: state.workspaceDirty || activeCanvasId !== state.projectFile.workspace.lastOpenedCanvasId,
+        workspaceRevision: activeCanvasId !== state.projectFile.workspace.lastOpenedCanvasId
+          ? state.workspaceRevision + 1
+          : state.workspaceRevision,
         selection: null,
       });
     },

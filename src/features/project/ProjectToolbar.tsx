@@ -1,17 +1,24 @@
 import { useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { ExportDialog } from "../export/ExportDialog";
-import { createNewProject, openProject, saveProject } from "./projectPersistence";
+import { RecoveryChoiceDialog } from "./RecoveryChoiceDialog";
+import { SaveHistoryDialog } from "./SaveHistoryDialog";
+import { createNewProject, openProject, saveProject, type PendingProjectOpen } from "./projectPersistence";
 
 export function ProjectToolbar() {
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [pendingOpen, setPendingOpen] = useState<PendingProjectOpen | null>(null);
   const title = useAppStore((state) => state.projectFile.project.title);
   const hasStart = useAppStore((state) => Boolean(state.projectFile.project.start));
   const canSetStart = useAppStore((state) => state.selection?.type === "placements" && state.selection.ids.length === 1);
   const contentDirty = useAppStore((state) => state.contentDirty);
+  const workspaceDirty = useAppStore((state) => state.workspaceDirty);
   const currentFilePath = useAppStore((state) => state.currentFilePath);
   const saveState = useAppStore((state) => state.saveState);
+  const autosaveState = useAppStore((state) => state.autosaveState);
+  const lastAutosavedAt = useAppStore((state) => state.lastAutosavedAt);
   const pastCount = useAppStore((state) => state.past.length);
   const futureCount = useAppStore((state) => state.future.length);
   const createCard = useAppStore((state) => state.createCardAtCenter);
@@ -41,18 +48,24 @@ export function ProjectToolbar() {
   const deleteBookmark = useAppStore((state) => state.deleteBookmark);
   const goToBookmark = useAppStore((state) => state.goToBookmark);
 
+  const dirty = contentDirty || workspaceDirty || !currentFilePath;
   const status = saveState === "saving"
     ? "Saving..."
-    : contentDirty || !currentFilePath ? "Unsaved changes" : "Saved";
+    : autosaveState === "saving"
+      ? "Creating recovery..."
+      : dirty && lastAutosavedAt
+        ? `Recovery ${new Date(lastAutosavedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+        : dirty ? "Unsaved changes" : "Saved";
 
   return (
     <header className="project-toolbar">
       <div className="brand-block"><span className="brand-mark">S</span><div><strong>SHEPHERD</strong><span>{title}</span></div></div>
       <nav className="toolbar-actions" aria-label="Project actions">
         <button type="button" onClick={() => void createNewProject()}>New</button>
-        <button type="button" onClick={() => void openProject()}>Open</button>
+        <button type="button" onClick={() => void openProject().then((pending) => setPendingOpen(pending))}>Open</button>
         <button type="button" onClick={() => void saveProject()}>Save</button>
         <button type="button" onClick={() => void saveProject(true)}>Save As</button>
+        <button type="button" onClick={() => setHistoryOpen(true)}>History</button>
         <span className="toolbar-rule" />
         <button className="primary-button" type="button" onClick={createCard}>+ Card</button>
         <button type="button" onClick={createArea}>+ Area</button>
@@ -72,7 +85,7 @@ export function ProjectToolbar() {
         <button type="button" onClick={undo} disabled={pastCount === 0} title="Undo (Ctrl/Cmd+Z)">Undo</button>
         <button type="button" onClick={redo} disabled={futureCount === 0} title="Redo (Ctrl/Cmd+Shift+Z)">Redo</button>
       </nav>
-      <div className={`save-indicator ${contentDirty ? "is-dirty" : ""}`}><span />{status}</div>
+      <div className={`save-indicator ${dirty ? "is-dirty" : ""}`}><span />{status}</div>
       {bookmarksOpen ? (
         <section className="bookmark-popover">
           <div className="popover-heading"><span>BOOKMARKS</span><button type="button" onClick={() => {
@@ -91,6 +104,14 @@ export function ProjectToolbar() {
         </section>
       ) : null}
       <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} />
+      <SaveHistoryDialog open={historyOpen} onClose={() => setHistoryOpen(false)} />
+      {pendingOpen ? (
+        <RecoveryChoiceDialog
+          candidate={pendingOpen.recovery}
+          pendingOpen={pendingOpen}
+          onClose={() => setPendingOpen(null)}
+        />
+      ) : null}
     </header>
   );
 }

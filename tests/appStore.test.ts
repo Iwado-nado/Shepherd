@@ -61,7 +61,7 @@ describe("Core store operations", () => {
 
   it("keeps viewport changes outside history and content dirty state", () => {
     const state = useAppStore.getState();
-    state.markSaved("/tmp/test.storyflow", state.currentRevision);
+    state.markSaved("/tmp/test.storyflow", state.currentRevision, state.workspaceRevision);
     const canvas = useAppStore.getState().projectFile.project.canvases[0];
     const historyLength = useAppStore.getState().past.length;
 

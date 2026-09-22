@@ -1,10 +1,17 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CanvasView } from "../features/canvas/CanvasView";
 import { Inspector } from "../features/editor/Inspector";
 import { CanvasSidebar } from "../features/project/CanvasSidebar";
 import { ProjectToolbar } from "../features/project/ProjectToolbar";
-import { confirmDiscardChanges, saveProject } from "../features/project/projectPersistence";
+import { RecoveryChoiceDialog } from "../features/project/RecoveryChoiceDialog";
+import {
+  autosaveRecovery,
+  confirmDiscardChanges,
+  listRecoveryCandidates,
+  saveProject,
+  type RecoveryCandidate,
+} from "../features/project/projectPersistence";
 import { CommandPalette } from "../features/search/CommandPalette";
 import { FilterPanel } from "../features/search/FilterPanel";
 import { useAppStore } from "../store/appStore";
@@ -18,6 +25,7 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 export function App() {
+  const [startupRecovery, setStartupRecovery] = useState<RecoveryCandidate | null>(null);
   const deleteSelection = useAppStore((state) => state.deleteSelection);
   const undo = useAppStore((state) => state.undo);
   const redo = useAppStore((state) => state.redo);
@@ -30,10 +38,12 @@ export function App() {
   const workspaceDirty = useAppStore((state) => state.workspaceDirty);
   const currentFilePath = useAppStore((state) => state.currentFilePath);
   const currentRevision = useAppStore((state) => state.currentRevision);
+  const workspaceRevision = useAppStore((state) => state.workspaceRevision);
   const saveState = useAppStore((state) => state.saveState);
   const autoSavePaused = useAppStore((state) => state.autoSavePaused);
   const lastError = useAppStore((state) => state.lastError);
   const setSaveState = useAppStore((state) => state.setSaveState);
+  const setAutosaveState = useAppStore((state) => state.setAutosaveState);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -84,12 +94,25 @@ export function App() {
   }, [copySelection, deleteSelection, navigateBack, navigateForward, openSearch, pasteSelection, redo, undo]);
 
   useEffect(() => {
-    if (autoSavePaused || (!contentDirty && !workspaceDirty) || !currentFilePath || saveState === "saving") return;
+    if (autoSavePaused || (!contentDirty && !workspaceDirty) || saveState === "saving") return;
     const timer = window.setTimeout(() => {
-      if (!useAppStore.getState().autoSavePaused) void saveProject(false, false);
+      if (!useAppStore.getState().autoSavePaused) void autosaveRecovery();
     }, 2500);
     return () => window.clearTimeout(timer);
-  }, [autoSavePaused, contentDirty, currentFilePath, currentRevision, saveState, workspaceDirty]);
+  }, [autoSavePaused, contentDirty, currentFilePath, currentRevision, saveState, workspaceDirty, workspaceRevision]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    useAppStore.getState().setAutoSavePaused(true);
+    void listRecoveryCandidates().then((candidates) => {
+      const unsaved = candidates.find((candidate) => candidate.originalFilePath === null);
+      if (unsaved) setStartupRecovery(unsaved);
+      else useAppStore.getState().setAutoSavePaused(false);
+    }).catch((error: unknown) => {
+      useAppStore.getState().setAutoSavePaused(false);
+      useAppStore.getState().setAutosaveState("error", error instanceof Error ? error.message : String(error));
+    });
+  }, []);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -125,7 +148,7 @@ export function App() {
         <div className="error-banner" role="alert">
           <strong>Project operation failed</strong>
           <span>{lastError}</span>
-          <button type="button" onClick={() => setSaveState("idle")}>Dismiss</button>
+          <button type="button" onClick={() => { setSaveState("idle"); setAutosaveState("idle"); }}>Dismiss</button>
         </div>
       ) : null}
       <main className="workspace">
@@ -133,6 +156,12 @@ export function App() {
         <CanvasView />
         <Inspector />
       </main>
+      {startupRecovery ? (
+        <RecoveryChoiceDialog candidate={startupRecovery} onClose={() => {
+          setStartupRecovery(null);
+          useAppStore.getState().setAutoSavePaused(false);
+        }} />
+      ) : null}
     </div>
   );
 }
