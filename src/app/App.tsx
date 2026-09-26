@@ -1,41 +1,36 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CanvasView } from "../features/canvas/CanvasView";
+import { deleteSelectionByKey, isEditableTarget, isMutedShortcut, shouldHandleSelectionDelete } from "../features/canvas/selectionCommands";
 import { Inspector } from "../features/editor/Inspector";
+import { StoryEditor } from "../features/editor/StoryEditor";
 import { CanvasSidebar } from "../features/project/CanvasSidebar";
 import { ProjectToolbar } from "../features/project/ProjectToolbar";
 import { RecoveryChoiceDialog } from "../features/project/RecoveryChoiceDialog";
 import {
   autosaveRecovery,
-  confirmDiscardChanges,
+  completeCloseRequest,
   listRecoveryCandidates,
   saveProject,
   type RecoveryCandidate,
 } from "../features/project/projectPersistence";
 import { CommandPalette } from "../features/search/CommandPalette";
-import { FilterPanel } from "../features/search/FilterPanel";
 import { useAppStore } from "../store/appStore";
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    (target instanceof HTMLElement && target.isContentEditable)
-  );
-}
 
 export function App() {
   const [startupRecovery, setStartupRecovery] = useState<RecoveryCandidate | null>(null);
-  const deleteSelection = useAppStore((state) => state.deleteSelection);
   const undo = useAppStore((state) => state.undo);
   const redo = useAppStore((state) => state.redo);
   const copySelection = useAppStore((state) => state.copySelection);
   const pasteSelection = useAppStore((state) => state.pasteSelection);
+  const duplicateSelection = useAppStore((state) => state.duplicateSelection);
+  const toggleMutedSelection = useAppStore((state) => state.toggleMutedSelection);
   const openSearch = useAppStore((state) => state.openSearch);
   const navigateBack = useAppStore((state) => state.navigateBack);
   const navigateForward = useAppStore((state) => state.navigateForward);
   const contentDirty = useAppStore((state) => state.contentDirty);
   const workspaceDirty = useAppStore((state) => state.workspaceDirty);
+  const focusedEditorDirty = useAppStore((state) => Boolean(state.storyEditor?.dirty));
   const currentFilePath = useAppStore((state) => state.currentFilePath);
   const currentRevision = useAppStore((state) => state.currentRevision);
   const workspaceRevision = useAppStore((state) => state.workspaceRevision);
@@ -48,6 +43,12 @@ export function App() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const modifier = event.metaKey || event.ctrlKey;
+      if (modifier && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void saveProject(event.shiftKey);
+        return;
+      }
+      if (isEditableTarget(event.target)) return;
       if (event.altKey && event.key === "ArrowLeft") {
         event.preventDefault();
         navigateBack();
@@ -58,11 +59,6 @@ export function App() {
         navigateForward();
         return;
       }
-      if (modifier && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        void saveProject(event.shiftKey);
-        return;
-      }
       if (modifier && event.key.toLowerCase() === "k") {
         event.preventDefault();
         openSearch("project");
@@ -70,17 +66,31 @@ export function App() {
       }
       if (modifier && event.key.toLowerCase() === "f") {
         event.preventDefault();
-        openSearch("canvas");
+        document.getElementById("sidebar-search")?.focus();
         return;
       }
-      if (isEditableTarget(event.target)) return;
+      if (modifier && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        duplicateSelection();
+        return;
+      }
+      if (isMutedShortcut(event)) {
+        const state = useAppStore.getState();
+        if (!state.storyEditor && !state.searchMode && (state.selection?.type === "card" || state.selection?.type === "placements")) {
+          event.preventDefault();
+          toggleMutedSelection();
+          return;
+        }
+      }
+      if (shouldHandleSelectionDelete(event.key, event.target)) {
+        event.preventDefault();
+        void deleteSelectionByKey(event.key);
+        return;
+      }
       if (modifier && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) redo();
         else undo();
-      } else if (event.key === "Delete") {
-        event.preventDefault();
-        deleteSelection();
       } else if (modifier && event.key.toLowerCase() === "c") {
         event.preventDefault();
         copySelection();
@@ -91,15 +101,15 @@ export function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [copySelection, deleteSelection, navigateBack, navigateForward, openSearch, pasteSelection, redo, undo]);
+  }, [copySelection, duplicateSelection, navigateBack, navigateForward, openSearch, pasteSelection, redo, toggleMutedSelection, undo]);
 
   useEffect(() => {
-    if (autoSavePaused || (!contentDirty && !workspaceDirty) || saveState === "saving") return;
+    if (autoSavePaused || (!contentDirty && !workspaceDirty && !focusedEditorDirty) || saveState === "saving") return;
     const timer = window.setTimeout(() => {
       if (!useAppStore.getState().autoSavePaused) void autosaveRecovery();
     }, 2500);
     return () => window.clearTimeout(timer);
-  }, [autoSavePaused, contentDirty, currentFilePath, currentRevision, saveState, workspaceDirty, workspaceRevision]);
+  }, [autoSavePaused, contentDirty, currentFilePath, currentRevision, focusedEditorDirty, saveState, workspaceDirty, workspaceRevision]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -121,12 +131,9 @@ export function App() {
     void appWindow
       .onCloseRequested(async (event) => {
         event.preventDefault();
-        useAppStore.getState().setAutoSavePaused(true);
         try {
-          if (await confirmDiscardChanges()) await appWindow.destroy();
-          else useAppStore.getState().setAutoSavePaused(false);
+          await completeCloseRequest(() => appWindow.destroy());
         } catch (error) {
-          useAppStore.getState().setAutoSavePaused(false);
           useAppStore.getState().setSaveState(
             "error",
             error instanceof Error ? error.message : String(error),
@@ -143,7 +150,6 @@ export function App() {
     <div className="app-shell">
       <ProjectToolbar />
       <CommandPalette />
-      <FilterPanel />
       {lastError ? (
         <div className="error-banner" role="alert">
           <strong>Project operation failed</strong>
@@ -156,6 +162,7 @@ export function App() {
         <CanvasView />
         <Inspector />
       </main>
+      <StoryEditor />
       {startupRecovery ? (
         <RecoveryChoiceDialog candidate={startupRecovery} onClose={() => {
           setStartupRecovery(null);

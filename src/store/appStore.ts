@@ -1,6 +1,7 @@
 import { applyPatches, enablePatches, produce, produceWithPatches, type Draft, type Patch } from "immer";
 import { create } from "zustand";
 import { getAreaBounds } from "../domain/area";
+import { connectsPlacementPair } from "../domain/edges";
 import {
   COMPACT_CARD_HEIGHT,
   COMPACT_CARD_WIDTH,
@@ -8,7 +9,9 @@ import {
   type CanvasId,
   type CardDisplayMode,
   type Edge,
+  type EdgeDirection,
   type EdgeId,
+  type EdgeLineStyle,
   type Placement,
   type PlacementId,
   type Position,
@@ -16,13 +19,13 @@ import {
   type ProjectFile,
   type Viewport,
 } from "../domain/models";
+import { clampCardSize } from "../domain/cardSize";
 import { createCanvas, createId, createProjectFile, DEFAULT_CARD_SIZE } from "../domain/project";
 
 enablePatches();
 
 const HISTORY_LIMIT = 100;
 const NAVIGATION_LIMIT = 100;
-const AREA_COLORS = ["#7f9450", "#b46d55", "#557f91", "#8b6b9f", "#9a844d"];
 
 export type Selection =
   | { type: "placements"; ids: PlacementId[] }
@@ -32,7 +35,7 @@ export type Selection =
   | null;
 
 interface ClipboardData {
-  cards: Array<{ oldId: string; title: string; body: string; tags: string[] }>;
+  cards: Array<{ oldId: string; title: string; body: string; tags: string[]; color: string; muted: boolean }>;
   placements: Placement[];
   edges: Edge[];
 }
@@ -56,6 +59,15 @@ export type AutosaveState = "idle" | "saving" | "error";
 export type SearchMode = "canvas" | "project" | null;
 export type FilterBehavior = "dim" | "hide";
 export type TagFilterMode = "any" | "all";
+
+export interface StoryEditorSession {
+  cardId: string;
+  title: string;
+  tags: string[];
+  tagInput: string;
+  body: string;
+  dirty: boolean;
+}
 
 interface AppState {
   projectFile: ProjectFile;
@@ -81,6 +93,8 @@ interface AppState {
   viewportNonce: number;
   searchMode: SearchMode;
   searchQuery: string;
+  sidebarSearchQuery: string;
+  sidebarSearchScope: Exclude<SearchMode, null>;
   activeTag: string | null;
   filterTags: string[];
   filterBehavior: FilterBehavior;
@@ -88,6 +102,7 @@ interface AppState {
   filterPanelOpen: boolean;
   navigationBack: NavigationLocation[];
   navigationForward: NavigationLocation[];
+  storyEditor: StoryEditorSession | null;
 
   newProject: (title?: string) => void;
   loadProject: (projectFile: ProjectFile, path: string) => void;
@@ -99,15 +114,26 @@ interface AppState {
   setAutoSavePaused: (paused: boolean) => void;
   setCanvasSize: (width: number, height: number) => void;
   setSelection: (selection: Selection) => void;
+  openStoryEditor: (cardId: string) => void;
+  updateStoryEditorTitle: (title: string) => void;
+  updateStoryEditorTags: (tags: string[]) => void;
+  updateStoryEditorTagInput: (value: string) => void;
+  updateStoryEditorBody: (body: string) => void;
+  commitStoryEditor: () => void;
+  closeStoryEditor: () => void;
   openSearch: (mode: Exclude<SearchMode, null>) => void;
   closeSearch: () => void;
   setSearchQuery: (query: string) => void;
+  setSearchScope: (scope: Exclude<SearchMode, null>) => void;
+  setSidebarSearchQuery: (query: string) => void;
+  toggleSidebarSearchScope: () => void;
   setActiveTag: (tag: string | null) => void;
   toggleFilterTag: (tag: string) => void;
   setFilterBehavior: (behavior: FilterBehavior) => void;
   setTagFilterMode: (mode: TagFilterMode) => void;
   toggleFilterPanel: () => void;
   clearFilters: () => void;
+  deleteTag: (tag: string) => void;
   addCanvas: () => void;
   duplicateCanvas: (canvasId: CanvasId) => void;
   moveCanvas: (canvasId: CanvasId, direction: -1 | 1) => void;
@@ -116,29 +142,39 @@ interface AppState {
   switchCanvas: (canvasId: CanvasId) => void;
   updateViewport: (canvasId: CanvasId, viewport: Viewport) => void;
   setDisplayMode: (mode: CardDisplayMode) => void;
+  resizePlacement: (placementId: PlacementId, size: Placement["size"]) => void;
   focusPlacement: (canvasId: CanvasId, placementId: PlacementId) => void;
   focusArea: (canvasId: CanvasId, areaId: AreaId) => void;
   createCardAtCenter: () => void;
+  createCardAt: (position: Position) => void;
   createUnplacedCard: () => void;
   placeExistingCard: (cardId: string, position?: Position) => void;
-  updateCard: (cardId: string, changes: { title?: string; body?: string; tags?: string[] }) => void;
+  updateCard: (cardId: string, changes: { title?: string; body?: string; tags?: string[]; color?: string }) => void;
+  updateSelectedCardsColor: (color: string) => void;
+  toggleMutedSelection: () => void;
   deleteCard: (cardId: string) => void;
+  deleteCards: (cardIds: string[]) => void;
   movePlacements: (moves: Array<{ id: PlacementId; position: Position }>, areaId?: AreaId | null) => void;
   createEdge: (sourcePlacementId: PlacementId, targetPlacementId: PlacementId) => void;
   updateEdgeLabel: (edgeId: EdgeId, label: string) => void;
+  updateEdgeDirection: (edgeId: EdgeId, direction: EdgeDirection) => void;
+  updateEdgeLineStyle: (edgeId: EdgeId, lineStyle: EdgeLineStyle) => void;
   createArea: () => void;
   updateArea: (areaId: AreaId, changes: { title?: string; color?: string; tags?: string[] }) => void;
   toggleArea: (areaId: AreaId) => void;
   moveArea: (areaId: AreaId, delta: Position) => void;
   setStart: () => void;
+  toggleStartForPlacement: (placementId: PlacementId) => void;
   goToStart: () => void;
   addBookmark: (title: string) => void;
+  toggleBookmarkForPlacement: (placementId: PlacementId) => void;
   deleteBookmark: (bookmarkId: string) => void;
   goToBookmark: (bookmarkId: string) => void;
   navigateBack: () => void;
   navigateForward: () => void;
   copySelection: () => void;
   pasteSelection: () => void;
+  duplicateSelection: () => void;
   deleteSelection: () => void;
   undo: () => void;
   redo: () => void;
@@ -156,6 +192,10 @@ function viewportsEqual(a: Viewport, b: Viewport): boolean {
 
 export function normalizeTags(tags: string[]): string[] {
   return [...new Set(tags.map((tag) => tag.trim().replace(/^#+/, "")).filter(Boolean))];
+}
+
+export function tagsFromInput(value: string): string[] {
+  return normalizeTags(value.split(/[#,，\s\u3000]+/u));
 }
 
 function centeredViewport(
@@ -259,6 +299,96 @@ export const useAppStore = create<AppState>((set, get) => {
     return true;
   };
 
+  const selectedCardClipboard = (state: AppState): ClipboardData | null => {
+    const canvas = getActiveCanvas(state);
+    const selection = state.selection;
+    if (!canvas || !selection) return null;
+    let placements: Placement[];
+    if (selection.type === "placements") {
+      const ids = new Set(selection.ids);
+      placements = canvas.placements.filter((placement) => ids.has(placement.id));
+    } else if (selection.type === "card") {
+      const card = state.projectFile.project.cards.find((item) => item.id === selection.id);
+      if (!card) return null;
+      const local = canvas.placements.find((placement) => placement.cardId === card.id);
+      const other = state.projectFile.project.canvases.flatMap((item) => item.placements)
+        .find((placement) => placement.cardId === card.id);
+      const size = local?.size ?? other?.size ?? cardSizeForMode(canvas.displayMode);
+      placements = local ? [local] : [{
+        id: createId(),
+        cardId: card.id,
+        canvasId: canvas.id,
+        position: {
+          x: (state.canvasSize.width / 2 - canvas.viewport.x) / canvas.viewport.zoom - size.width / 2 - 32,
+          y: (state.canvasSize.height / 2 - canvas.viewport.y) / canvas.viewport.zoom - size.height / 2 - 32,
+        },
+        size,
+      }];
+    } else return null;
+    if (!placements.length) return null;
+    const ids = new Set(placements.map((placement) => placement.id));
+    const cardIds = new Set(placements.map((placement) => placement.cardId));
+    return {
+      cards: state.projectFile.project.cards
+        .filter((card) => cardIds.has(card.id))
+        .map((card) => ({ oldId: card.id, title: card.title, body: card.body, tags: [...card.tags], color: card.color, muted: card.muted })),
+      placements: placements.map((placement) => ({
+        ...placement, position: { ...placement.position }, size: { ...placement.size },
+      })),
+      edges: canvas.edges.filter((edge) => ids.has(edge.sourcePlacementId) && ids.has(edge.targetPlacementId)),
+    };
+  };
+
+  const pasteClipboard = (clipboard: ClipboardData | null, label: string) => {
+    const canvasId = get().projectFile.workspace.lastOpenedCanvasId;
+    if (!clipboard?.cards.length || !clipboard.placements.length ||
+        !get().projectFile.project.canvases.some((canvas) => canvas.id === canvasId)) return;
+    const cardMap = new Map(clipboard.cards.map((card) => [card.oldId, createId()]));
+    const placements = clipboard.placements.filter((placement) => cardMap.has(placement.cardId));
+    if (!placements.length) return;
+    const placementMap = new Map(placements.map((placement) => [placement.id, createId()]));
+    const now = new Date().toISOString();
+    if (commitProject(label, (project) => {
+      for (const card of clipboard.cards) {
+        project.cards.push({
+          id: cardMap.get(card.oldId)!,
+          title: card.title,
+          body: card.body,
+          tags: [...card.tags],
+          color: card.color,
+          muted: card.muted,
+          createdAt: now,
+          updatedAt: now,
+        });
+        for (const tag of card.tags) if (!project.tags.includes(tag)) project.tags.push(tag);
+      }
+      const canvas = project.canvases.find((item) => item.id === canvasId);
+      if (!canvas) return;
+      for (const placement of placements) {
+        canvas.placements.push({
+          ...placement,
+          id: placementMap.get(placement.id)!,
+          cardId: cardMap.get(placement.cardId)!,
+          canvasId,
+          position: { x: placement.position.x + 32, y: placement.position.y + 32 },
+          size: { ...placement.size },
+          areaId: undefined,
+        });
+      }
+      for (const edge of clipboard.edges) {
+        const sourcePlacementId = placementMap.get(edge.sourcePlacementId);
+        const targetPlacementId = placementMap.get(edge.targetPlacementId);
+        if (sourcePlacementId && targetPlacementId) canvas.edges.push({
+          ...edge,
+          id: createId(),
+          canvasId,
+          sourcePlacementId,
+          targetPlacementId,
+        });
+      }
+    })) set({ selection: { type: "placements", ids: [...placementMap.values()] } });
+  };
+
   const focusViewport = (
     canvasId: CanvasId,
     selection: Selection,
@@ -313,6 +443,8 @@ export const useAppStore = create<AppState>((set, get) => {
     viewportNonce: 0,
     searchMode: null,
     searchQuery: "",
+    sidebarSearchQuery: "",
+    sidebarSearchScope: "project",
     activeTag: null,
     filterTags: [],
     filterBehavior: "dim",
@@ -320,6 +452,7 @@ export const useAppStore = create<AppState>((set, get) => {
     filterPanelOpen: false,
     navigationBack: [],
     navigationForward: [],
+    storyEditor: null,
 
     newProject: (title) => set({
       projectFile: createProjectFile(title),
@@ -344,6 +477,8 @@ export const useAppStore = create<AppState>((set, get) => {
       viewportNonce: 0,
       searchMode: null,
       searchQuery: "",
+      sidebarSearchQuery: "",
+      sidebarSearchScope: "project",
       activeTag: null,
       filterTags: [],
       filterBehavior: "dim",
@@ -351,6 +486,7 @@ export const useAppStore = create<AppState>((set, get) => {
       filterPanelOpen: false,
       navigationBack: [],
       navigationForward: [],
+      storyEditor: null,
     }),
 
     loadProject: (projectFile, path) => set({
@@ -376,6 +512,8 @@ export const useAppStore = create<AppState>((set, get) => {
       viewportNonce: 0,
       searchMode: null,
       searchQuery: "",
+      sidebarSearchQuery: "",
+      sidebarSearchScope: "project",
       activeTag: null,
       filterTags: [],
       filterBehavior: "dim",
@@ -383,6 +521,7 @@ export const useAppStore = create<AppState>((set, get) => {
       filterPanelOpen: false,
       navigationBack: [],
       navigationForward: [],
+      storyEditor: null,
     }),
 
     restoreProject: (projectFile, path) => {
@@ -410,8 +549,11 @@ export const useAppStore = create<AppState>((set, get) => {
         viewportNonce: state.viewportNonce + 1,
         searchMode: null,
         searchQuery: "",
+        sidebarSearchQuery: "",
+        sidebarSearchScope: "project",
         navigationBack: [],
         navigationForward: [],
+        storyEditor: null,
       });
     },
 
@@ -449,9 +591,110 @@ export const useAppStore = create<AppState>((set, get) => {
     setSelection: (selection) => {
       if (!selectionsEqual(get().selection, selection)) set({ selection });
     },
+    openStoryEditor: (cardId) => {
+      const state = get();
+      const card = state.projectFile.project.cards.find((item) => item.id === cardId);
+      if (!card) return;
+      if (state.storyEditor?.cardId === cardId) return;
+      if (state.storyEditor) get().commitStoryEditor();
+      set({
+        storyEditor: {
+          cardId,
+          title: card.title,
+          tags: [...card.tags],
+          tagInput: "",
+          body: card.body,
+          dirty: false,
+        },
+      });
+    },
+    updateStoryEditorTitle: (title) => {
+      const state = get();
+      const session = state.storyEditor;
+      if (!session || session.title === title) return;
+      const card = state.projectFile.project.cards.find((item) => item.id === session.cardId);
+      set({
+        storyEditor: {
+          ...session,
+          title,
+          dirty: !card || title !== card.title || session.body !== card.body ||
+            session.tags.join("\0") !== card.tags.join("\0") || Boolean(session.tagInput.trim()),
+        },
+      });
+    },
+    updateStoryEditorTags: (tags) => {
+      const state = get();
+      const session = state.storyEditor;
+      if (!session) return;
+      const normalized = normalizeTags(tags);
+      if (session.tags.join("\0") === normalized.join("\0")) return;
+      const card = state.projectFile.project.cards.find((item) => item.id === session.cardId);
+      set({
+        storyEditor: {
+          ...session,
+          tags: normalized,
+          dirty: !card || session.title !== card.title || session.body !== card.body ||
+            normalized.join("\0") !== card.tags.join("\0") || Boolean(session.tagInput.trim()),
+        },
+      });
+    },
+    updateStoryEditorTagInput: (tagInput) => {
+      const state = get();
+      const session = state.storyEditor;
+      if (!session || session.tagInput === tagInput) return;
+      const card = state.projectFile.project.cards.find((item) => item.id === session.cardId);
+      set({
+        storyEditor: {
+          ...session,
+          tagInput,
+          dirty: !card || session.title !== card.title || session.body !== card.body ||
+            session.tags.join("\0") !== card.tags.join("\0") || Boolean(tagInput.trim()),
+        },
+      });
+    },
+    updateStoryEditorBody: (body) => {
+      const state = get();
+      const session = state.storyEditor;
+      if (!session || session.body === body) return;
+      const card = state.projectFile.project.cards.find((item) => item.id === session.cardId);
+      set({
+        storyEditor: {
+          ...session,
+          body,
+          dirty: !card || session.title !== card.title || body !== card.body ||
+            session.tags.join("\0") !== card.tags.join("\0") || Boolean(session.tagInput.trim()),
+        },
+      });
+    },
+    commitStoryEditor: () => {
+      const session = get().storyEditor;
+      if (!session?.dirty) return;
+      const pendingTags = tagsFromInput(session.tagInput);
+      const tags = normalizeTags([...session.tags, ...pendingTags]);
+      get().updateCard(session.cardId, {
+        title: session.title,
+        tags,
+        body: session.body,
+      });
+      const current = get().storyEditor;
+      if (current?.cardId === session.cardId) {
+        set({ storyEditor: { ...current, tags, tagInput: "", dirty: false } });
+      }
+    },
+    closeStoryEditor: () => {
+      get().commitStoryEditor();
+      set({ storyEditor: null });
+    },
     openSearch: (searchMode) => set({ searchMode, searchQuery: "" }),
     closeSearch: () => set({ searchMode: null, searchQuery: "" }),
     setSearchQuery: (searchQuery) => set({ searchQuery }),
+    setSearchScope: (searchMode) => {
+      if (get().searchMode) set({ searchMode });
+    },
+    setSidebarSearchQuery: (sidebarSearchQuery) => set({ sidebarSearchQuery }),
+    toggleSidebarSearchScope: () => set((state) => ({
+      sidebarSearchScope: state.sidebarSearchScope === "project" ? "canvas" : "project",
+    })),
     setActiveTag: (activeTag) => set({ activeTag }),
     toggleFilterTag: (tag) => {
       const tags = get().filterTags;
@@ -461,6 +704,44 @@ export const useAppStore = create<AppState>((set, get) => {
     setTagFilterMode: (tagFilterMode) => set({ tagFilterMode }),
     toggleFilterPanel: () => set((state) => ({ filterPanelOpen: !state.filterPanelOpen })),
     clearFilters: () => set({ activeTag: null, filterTags: [], filterBehavior: "dim", tagFilterMode: "any" }),
+    deleteTag: (tag) => {
+      const state = get();
+      if (!state.projectFile.project.tags.includes(tag)) return;
+      const now = new Date().toISOString();
+      if (!commitProject("Delete tag", (project) => {
+        project.tags = project.tags.filter((item) => item !== tag);
+        for (const card of project.cards) {
+          if (!card.tags.includes(tag)) continue;
+          card.tags = card.tags.filter((item) => item !== tag);
+          card.updatedAt = now;
+        }
+        for (const canvas of project.canvases) {
+          for (const area of canvas.areas) area.tags = area.tags.filter((item) => item !== tag);
+        }
+      })) return;
+      const next = get();
+      const session = next.storyEditor;
+      const card = session
+        ? next.projectFile.project.cards.find((item) => item.id === session.cardId)
+        : undefined;
+      const editorTags = session?.tags.filter((item) => item !== tag) ?? [];
+      const editorTagInput = session
+        ? tagsFromInput(session.tagInput).filter((item) => item !== tag).join(", ")
+        : "";
+      set({
+        activeTag: next.activeTag === tag ? null : next.activeTag,
+        filterTags: next.filterTags.filter((item) => item !== tag),
+        storyEditor: session && card
+          ? {
+              ...session,
+              tags: editorTags,
+              tagInput: editorTagInput,
+              dirty: session.title !== card.title || session.body !== card.body ||
+                editorTags.join("\0") !== card.tags.join("\0") || Boolean(editorTagInput),
+            }
+          : session,
+      });
+    },
 
     addCanvas: () => {
       const origin = currentNavigationLocation(get());
@@ -621,12 +902,32 @@ export const useAppStore = create<AppState>((set, get) => {
       const canvasId = get().projectFile.workspace.lastOpenedCanvasId;
       const canvas = get().projectFile.project.canvases.find((item) => item.id === canvasId);
       if (!canvas || canvas.displayMode === mode) return;
+      const previousSize = cardSizeForMode(canvas.displayMode);
       const size = cardSizeForMode(mode);
       commitProject("Change card display mode", (project) => {
         const target = project.canvases.find((item) => item.id === canvasId);
         if (!target) return;
         target.displayMode = mode;
-        for (const placement of target.placements) placement.size = { ...size };
+        for (const placement of target.placements) {
+          if (placement.size.width === previousSize.width && placement.size.height === previousSize.height) {
+            placement.size = { ...size };
+          }
+        }
+      });
+    },
+
+    resizePlacement: (placementId, size) => {
+      if (!Number.isFinite(size.width) || !Number.isFinite(size.height)) return;
+      const canvasId = get().projectFile.workspace.lastOpenedCanvasId;
+      const placement = get().projectFile.project.canvases
+        .find((canvas) => canvas.id === canvasId)?.placements.find((item) => item.id === placementId);
+      if (!placement) return;
+      const nextSize = clampCardSize(size);
+      if (placement.size.width === nextSize.width && placement.size.height === nextSize.height) return;
+      commitProject("Resize card", (project) => {
+        const target = project.canvases.find((canvas) => canvas.id === canvasId)
+          ?.placements.find((item) => item.id === placementId);
+        if (target) target.size = nextSize;
       });
     },
 
@@ -648,6 +949,16 @@ export const useAppStore = create<AppState>((set, get) => {
 
     createCardAtCenter: () => {
       const state = get();
+      const canvas = getActiveCanvas(state);
+      if (!canvas) return;
+      get().createCardAt({
+        x: (state.canvasSize.width / 2 - canvas.viewport.x) / canvas.viewport.zoom,
+        y: (state.canvasSize.height / 2 - canvas.viewport.y) / canvas.viewport.zoom,
+      });
+    },
+
+    createCardAt: (center) => {
+      const state = get();
       const canvasId = state.projectFile.workspace.lastOpenedCanvasId;
       const canvas = state.projectFile.project.canvases.find((item) => item.id === canvasId);
       if (!canvas) return;
@@ -655,12 +966,9 @@ export const useAppStore = create<AppState>((set, get) => {
       const cardId = createId();
       const placementId = createId();
       const size = cardSizeForMode(canvas.displayMode);
-      const position = {
-        x: (state.canvasSize.width / 2 - canvas.viewport.x) / canvas.viewport.zoom - size.width / 2,
-        y: (state.canvasSize.height / 2 - canvas.viewport.y) / canvas.viewport.zoom - size.height / 2,
-      };
+      const position = { x: center.x - size.width / 2, y: center.y - size.height / 2 };
       if (commitProject("Create card", (project) => {
-        project.cards.push({ id: cardId, title: "Untitled Card", body: "", tags: [], createdAt: now, updatedAt: now });
+        project.cards.push({ id: cardId, title: "Untitled Card", body: "", tags: [], color: "default", muted: false, createdAt: now, updatedAt: now });
         project.canvases.find((item) => item.id === canvasId)?.placements.push({
           id: placementId,
           cardId,
@@ -680,6 +988,8 @@ export const useAppStore = create<AppState>((set, get) => {
           title: "Untitled Card",
           body: "",
           tags: [],
+          color: "default",
+          muted: false,
           createdAt: now,
           updatedAt: now,
         });
@@ -719,39 +1029,90 @@ export const useAppStore = create<AppState>((set, get) => {
       const title = changes.title ?? card.title;
       const body = changes.body ?? card.body;
       const tags = changes.tags ? normalizeTags(changes.tags) : card.tags;
-      if (title === card.title && body === card.body && tags.join("\0") === card.tags.join("\0")) return;
+      const color = changes.color ?? card.color;
+      if (title === card.title && body === card.body && tags.join("\0") === card.tags.join("\0") && color === card.color) return;
       commitProject("Edit card", (project) => {
         const target = project.cards.find((item) => item.id === cardId);
         if (!target) return;
         target.title = title;
         target.body = body;
         target.tags = tags;
+        target.color = color;
         target.updatedAt = new Date().toISOString();
         for (const tag of tags) if (!project.tags.includes(tag)) project.tags.push(tag);
       });
     },
 
-    deleteCard: (cardId) => {
-      if (!get().projectFile.project.cards.some((card) => card.id === cardId)) return;
-      commitProject("Delete card", (project) => {
-        project.cards = project.cards.filter((card) => card.id !== cardId);
-        for (const canvas of project.canvases) {
-          const removed = new Set(
-            canvas.placements.filter((placement) => placement.cardId === cardId).map((item) => item.id),
-          );
-          canvas.placements = canvas.placements.filter((placement) => placement.cardId !== cardId);
-          canvas.edges = canvas.edges.filter(
-            (edge) => !removed.has(edge.sourcePlacementId) && !removed.has(edge.targetPlacementId),
-          );
-          if (project.start && removed.has(project.start.placementId)) project.start = undefined;
-          for (const bookmark of project.bookmarks) {
-            if (bookmark.targetPlacementId && removed.has(bookmark.targetPlacementId)) {
-              bookmark.targetPlacementId = undefined;
-            }
-          }
+    updateSelectedCardsColor: (color) => {
+      const state = get();
+      const canvas = getActiveCanvas(state);
+      const selection = state.selection;
+      if (!canvas || selection?.type !== "placements" || selection.ids.length < 2) return;
+      const placementIds = new Set(selection.ids);
+      const cardIds = new Set(canvas.placements.filter((placement) => placementIds.has(placement.id)).map((placement) => placement.cardId));
+      if (![...cardIds].some((id) => state.projectFile.project.cards.some((card) => card.id === id && card.color !== color))) return;
+      const now = new Date().toISOString();
+      commitProject("Change selected card colors", (project) => {
+        for (const card of project.cards) {
+          if (!cardIds.has(card.id) || card.color === color) continue;
+          card.color = color;
+          card.updatedAt = now;
         }
       });
-      set({ selection: null });
+    },
+
+    toggleMutedSelection: () => {
+      const state = get();
+      const selection = state.selection;
+      const canvas = getActiveCanvas(state);
+      const cardIds = selection?.type === "card"
+        ? [selection.id]
+        : selection?.type === "placements"
+          ? selection.ids.flatMap((id) => {
+              const cardId = canvas?.placements.find((placement) => placement.id === id)?.cardId;
+              return cardId ? [cardId] : [];
+            })
+          : [];
+      const ids = new Set(cardIds);
+      const selected = state.projectFile.project.cards.filter((card) => ids.has(card.id));
+      if (!selected.length) return;
+      const muted = selected.some((card) => !card.muted);
+      const now = new Date().toISOString();
+      commitProject(muted ? "Mute cards" : "Unmute cards", (project) => {
+        for (const card of project.cards) {
+          if (!ids.has(card.id) || card.muted === muted) continue;
+          card.muted = muted;
+          card.updatedAt = now;
+        }
+      });
+    },
+
+    deleteCard: (cardId) => get().deleteCards([cardId]),
+
+    deleteCards: (cardIds) => {
+      const ids = new Set(cardIds);
+      if (!get().projectFile.project.cards.some((card) => ids.has(card.id))) return;
+      if (commitProject(cardIds.length > 1 ? "Delete cards" : "Delete card", (project) => {
+        const removedPlacementIds = new Set<PlacementId>();
+        project.cards = project.cards.filter((card) => !ids.has(card.id));
+        for (const canvas of project.canvases) {
+          for (const placement of canvas.placements) {
+            if (ids.has(placement.cardId)) removedPlacementIds.add(placement.id);
+          }
+          canvas.placements = canvas.placements.filter((placement) => !ids.has(placement.cardId));
+        }
+        for (const canvas of project.canvases) {
+          canvas.edges = canvas.edges.filter(
+            (edge) => !removedPlacementIds.has(edge.sourcePlacementId) && !removedPlacementIds.has(edge.targetPlacementId),
+          );
+        }
+        if (project.start && removedPlacementIds.has(project.start.placementId)) project.start = undefined;
+        for (const bookmark of project.bookmarks) {
+          if (bookmark.targetPlacementId && removedPlacementIds.has(bookmark.targetPlacementId)) {
+            bookmark.targetPlacementId = undefined;
+          }
+        }
+      })) set({ selection: null });
     },
 
     movePlacements: (moves, areaId) => {
@@ -785,6 +1146,18 @@ export const useAppStore = create<AppState>((set, get) => {
       const canvas = state.projectFile.project.canvases.find((item) => item.id === canvasId);
       if (!canvas?.placements.some((item) => item.id === sourcePlacementId) ||
           !canvas.placements.some((item) => item.id === targetPlacementId)) return;
+      const existing = canvas.edges.filter((edge) => connectsPlacementPair(edge, sourcePlacementId, targetPlacementId));
+      if (existing.length > 1) return; // Ambiguous legacy duplicates cannot be merged without losing data.
+      if (existing.length === 1) {
+        const edge = existing[0];
+        if (edge.direction === "undirected" || edge.sourcePlacementId === sourcePlacementId) return;
+        commitProject("Make edge bidirectional", (project) => {
+          const target = project.canvases.find((item) => item.id === canvasId)
+            ?.edges.find((item) => item.id === edge.id);
+          if (target) target.direction = "undirected";
+        });
+        return;
+      }
       commitProject("Create edge", (project) => {
         project.canvases.find((item) => item.id === canvasId)?.edges.push({
           id: createId(),
@@ -793,6 +1166,7 @@ export const useAppStore = create<AppState>((set, get) => {
           targetPlacementId,
           label: "",
           direction: "directed",
+          lineStyle: "solid",
         });
       });
     },
@@ -803,6 +1177,24 @@ export const useAppStore = create<AppState>((set, get) => {
       commitProject("Edit edge label", (project) => {
         const edge = project.canvases.flatMap((canvas) => canvas.edges).find((item) => item.id === edgeId);
         if (edge) edge.label = label;
+      });
+    },
+
+    updateEdgeDirection: (edgeId, direction) => {
+      const current = get().projectFile.project.canvases.flatMap((canvas) => canvas.edges).find((edge) => edge.id === edgeId);
+      if (!current || current.direction === direction) return;
+      commitProject("Change edge direction", (project) => {
+        const edge = project.canvases.flatMap((canvas) => canvas.edges).find((item) => item.id === edgeId);
+        if (edge) edge.direction = direction;
+      });
+    },
+
+    updateEdgeLineStyle: (edgeId, lineStyle) => {
+      const current = get().projectFile.project.canvases.flatMap((canvas) => canvas.edges).find((edge) => edge.id === edgeId);
+      if (!current || current.lineStyle === lineStyle) return;
+      commitProject("Change edge line style", (project) => {
+        const edge = project.canvases.flatMap((canvas) => canvas.edges).find((item) => item.id === edgeId);
+        if (edge) edge.lineStyle = lineStyle;
       });
     },
 
@@ -826,7 +1218,7 @@ export const useAppStore = create<AppState>((set, get) => {
           id: areaId,
           canvasId,
           title: `Area ${(target?.areas.length ?? 0) + 1}`,
-          color: AREA_COLORS[(target?.areas.length ?? 0) % AREA_COLORS.length],
+          color: "default",
           tags: [],
           anchorX: anchor.x,
           anchorY: anchor.y,
@@ -892,6 +1284,21 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
+    toggleStartForPlacement: (placementId) => {
+      const state = get();
+      const canvas = getActiveCanvas(state);
+      const placement = canvas?.placements.find((item) => item.id === placementId);
+      if (!canvas || !placement) return;
+      if (state.projectFile.project.start?.canvasId === canvas.id && state.projectFile.project.start.placementId === placementId) {
+        commitProject("Clear START", (project) => { project.start = undefined; });
+        return;
+      }
+      const viewport = centeredViewport(placement.position, placement.size, canvas.viewport.zoom, state.canvasSize);
+      commitProject("Set START", (project) => {
+        project.start = { canvasId: canvas.id, placementId, viewport };
+      });
+    },
+
     goToStart: () => {
       const state = get();
       const start = state.projectFile.project.start;
@@ -933,6 +1340,32 @@ export const useAppStore = create<AppState>((set, get) => {
           title: cleanTitle,
           canvasId,
           ...(targetPlacementId ? { targetPlacementId } : {}),
+          viewport: { ...canvas.viewport },
+        });
+      });
+    },
+
+    toggleBookmarkForPlacement: (placementId) => {
+      const state = get();
+      const canvas = getActiveCanvas(state);
+      const placement = canvas?.placements.find((item) => item.id === placementId);
+      if (!canvas || !placement) return;
+      const existing = state.projectFile.project.bookmarks.filter((bookmark) =>
+        bookmark.canvasId === canvas.id && bookmark.targetPlacementId === placementId);
+      if (existing.length) {
+        commitProject("Remove card bookmarks", (project) => {
+          project.bookmarks = project.bookmarks.filter((bookmark) =>
+            bookmark.canvasId !== canvas.id || bookmark.targetPlacementId !== placementId);
+        });
+        return;
+      }
+      const card = state.projectFile.project.cards.find((item) => item.id === placement.cardId);
+      commitProject("Create bookmark", (project) => {
+        project.bookmarks.push({
+          id: createId(),
+          title: card?.title || "Untitled Card",
+          canvasId: canvas.id,
+          targetPlacementId: placementId,
           viewport: { ...canvas.viewport },
         });
       });
@@ -1016,77 +1449,19 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     copySelection: () => {
-      const state = get();
-      if (state.selection?.type !== "placements" || state.selection.ids.length === 0) return;
-      const canvas = getActiveCanvas(state);
-      if (!canvas) return;
-      const ids = new Set(state.selection.ids);
-      const placements = canvas.placements.filter((item) => ids.has(item.id));
-      const cardIds = new Set(placements.map((item) => item.cardId));
-      set({
-        clipboard: {
-          cards: state.projectFile.project.cards
-            .filter((card) => cardIds.has(card.id))
-            .map((card) => ({ oldId: card.id, title: card.title, body: card.body, tags: [...card.tags] })),
-          placements: placements.map((item) => ({ ...item, position: { ...item.position }, size: { ...item.size } })),
-          edges: canvas.edges.filter((edge) => ids.has(edge.sourcePlacementId) && ids.has(edge.targetPlacementId)),
-        },
-      });
+      const clipboard = selectedCardClipboard(get());
+      if (clipboard) set({ clipboard });
     },
 
-    pasteSelection: () => {
-      const state = get();
-      const clipboard = state.clipboard;
-      if (!clipboard) return;
-      const canvasId = state.projectFile.workspace.lastOpenedCanvasId;
-      const cardMap = new Map(clipboard.cards.map((card) => [card.oldId, createId()]));
-      const placementMap = new Map(clipboard.placements.map((item) => [item.id, createId()]));
-      const now = new Date().toISOString();
-      const newPlacementIds = [...placementMap.values()];
-      if (commitProject("Paste", (project) => {
-        for (const card of clipboard.cards) {
-          project.cards.push({
-            id: cardMap.get(card.oldId)!,
-            title: card.title,
-            body: card.body,
-            tags: [...card.tags],
-            createdAt: now,
-            updatedAt: now,
-          });
-        }
-        const canvas = project.canvases.find((item) => item.id === canvasId);
-        const targetSize = cardSizeForMode(canvas?.displayMode ?? "standard");
-        for (const placement of clipboard.placements) {
-          canvas?.placements.push({
-            ...placement,
-            id: placementMap.get(placement.id)!,
-            cardId: cardMap.get(placement.cardId)!,
-            canvasId,
-            position: { x: placement.position.x + 32, y: placement.position.y + 32 },
-            size: { ...targetSize },
-            areaId: undefined,
-          });
-        }
-        for (const edge of clipboard.edges) {
-          canvas?.edges.push({
-            ...edge,
-            id: createId(),
-            canvasId,
-            sourcePlacementId: placementMap.get(edge.sourcePlacementId)!,
-            targetPlacementId: placementMap.get(edge.targetPlacementId)!,
-          });
-        }
-      })) set({ selection: { type: "placements", ids: newPlacementIds } });
-    },
+    pasteSelection: () => pasteClipboard(get().clipboard, "Paste"),
+
+    duplicateSelection: () => pasteClipboard(selectedCardClipboard(get()), "Duplicate cards"),
 
     deleteSelection: () => {
       const state = get();
       const selection = state.selection;
       if (!selection) return;
-      if (selection.type === "card") {
-        get().deleteCard(selection.id);
-        return;
-      }
+      if (selection.type === "card") return;
       commitProject(
         selection.type === "placements" ? "Remove cards from canvas" : `Delete ${selection.type}`,
         (project) => {
@@ -1103,12 +1478,14 @@ export const useAppStore = create<AppState>((set, get) => {
             }
           } else {
             const ids = new Set(selection.ids);
-            for (const canvas of project.canvases) {
-              canvas.placements = canvas.placements.filter((item) => !ids.has(item.id));
-              canvas.edges = canvas.edges.filter(
-                (edge) => !ids.has(edge.sourcePlacementId) && !ids.has(edge.targetPlacementId),
-              );
-            }
+            const canvas = project.canvases.find(
+              (item) => item.id === state.projectFile.workspace.lastOpenedCanvasId,
+            );
+            if (!canvas) return;
+            canvas.placements = canvas.placements.filter((item) => !ids.has(item.id));
+            canvas.edges = canvas.edges.filter(
+              (edge) => !ids.has(edge.sourcePlacementId) && !ids.has(edge.targetPlacementId),
+            );
             if (project.start && ids.has(project.start.placementId)) project.start = undefined;
             for (const bookmark of project.bookmarks) {
               if (bookmark.targetPlacementId && ids.has(bookmark.targetPlacementId)) {

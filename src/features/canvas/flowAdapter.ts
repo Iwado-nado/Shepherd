@@ -1,14 +1,21 @@
 import { MarkerType, type Edge as FlowEdge, type Node } from "@xyflow/react";
 import { getAreaBounds } from "../../domain/area";
 import type { CanvasData, Card, Placement } from "../../domain/models";
+import type { CardSize } from "../../domain/cardSize";
 import type { FilterBehavior, TagFilterMode } from "../../store/appStore";
+import { cardDensityForSize, type CardDensity } from "./cardDensity";
+import { cardMatchesFilters } from "../search/searchCardPlacements";
 
 export interface CardNodeData extends Record<string, unknown> {
   title: string;
   bodyPreview: string;
   cardId: string;
   tags: string[];
-  displayMode: "standard" | "compact";
+  color: string;
+  muted: boolean;
+  isStart: boolean;
+  isBookmarked: boolean;
+  density: CardDensity;
 }
 
 export interface AreaNodeData extends Record<string, unknown> {
@@ -24,11 +31,20 @@ export interface AreaNodeData extends Record<string, unknown> {
 export type CardFlowNode = Node<CardNodeData, "card">;
 export type AreaFlowNode = Node<AreaNodeData, "area">;
 export type ShepherdFlowNode = CardFlowNode | AreaFlowNode;
-export type FlowNodeCanvas = Pick<CanvasData, "areas" | "displayMode" | "placements">;
+export type FlowNodeCanvas = Pick<CanvasData, "areas" | "placements">;
 export type FlowEdgeCanvas = Pick<CanvasData, "areas" | "edges" | "placements">;
+export interface CardSizePreview {
+  placementId: string;
+  size: CardSize;
+}
 
-function preview(body: string): string {
-  return body.replace(/\s+/g, " ").trim().slice(0, 120);
+export interface CardPlacementStatus {
+  startPlacementId?: string | null;
+  bookmarkedPlacementIds?: ReadonlySet<string>;
+}
+
+function preview(body: string, length: number): string {
+  return body.replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").trim().slice(0, length);
 }
 
 function tagsMatch(tags: string[], filters: string[], mode: TagFilterMode): boolean {
@@ -36,15 +52,6 @@ function tagsMatch(tags: string[], filters: string[], mode: TagFilterMode): bool
   return mode === "all"
     ? filters.every((tag) => tags.includes(tag))
     : filters.some((tag) => tags.includes(tag));
-}
-
-function cardMatches(card: Card, query: string, filterTags: string[], tagMode: TagFilterMode): boolean {
-  if (!tagsMatch(card.tags, filterTags, tagMode)) return false;
-  if (!query) return true;
-  const needle = query.toLocaleLowerCase();
-  return [card.title, card.body, ...card.tags].some((value) =>
-    value.toLocaleLowerCase().includes(needle),
-  );
 }
 
 export function toFlowNodes(
@@ -56,9 +63,15 @@ export function toFlowNodes(
   filterTags: string[],
   tagMode: TagFilterMode,
   filterBehavior: FilterBehavior,
+  resizePreview?: CardSizePreview,
+  status?: CardPlacementStatus,
 ): ShepherdFlowNode[] {
   const cardsById = new Map(cards.map((card) => [card.id, card]));
   const collapsedAreaIds = new Set(canvas.areas.filter((area) => area.collapsed).map((area) => area.id));
+  const visibleCardIds = new Set(canvas.placements.flatMap((placement) => {
+    const card = cardsById.get(placement.cardId);
+    return card && cardMatchesFilters(card, query, filterTags, tagMode) ? [card.id] : [];
+  }));
   const areaNodes = canvas.areas.flatMap<AreaFlowNode>((area) => {
     const bounds = getAreaBounds(area, canvas.placements);
     const count = canvas.placements.filter((placement) => placement.areaId === area.id).length;
@@ -66,7 +79,8 @@ export function toFlowNodes(
     const matchesQuery = !query || [area.title, ...area.tags].some((value) =>
       value.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
     );
-    const matches = matchesTag && matchesQuery;
+    const matches = (matchesTag && matchesQuery) || canvas.placements.some((placement) =>
+      placement.areaId === area.id && visibleCardIds.has(placement.cardId));
     if (filterBehavior === "hide" && !matches) return [];
     return [{
       id: area.id,
@@ -76,6 +90,7 @@ export function toFlowNodes(
       height: area.collapsed ? 52 : bounds.height,
       zIndex: -1,
       dragHandle: ".area-node-title",
+      selectable: true,
       selected: area.id === selectedAreaId,
       className: (query || filterTags.length) && !matches ? "is-dimmed" : undefined,
       data: {
@@ -93,22 +108,30 @@ export function toFlowNodes(
     if (placement.areaId && collapsedAreaIds.has(placement.areaId)) return [];
     const card = cardsById.get(placement.cardId);
     if (!card) return [];
-    const matches = cardMatches(card, query, filterTags, tagMode);
+    const matches = visibleCardIds.has(card.id);
     if (filterBehavior === "hide" && !matches) return [];
+    const size = resizePreview?.placementId === placement.id ? resizePreview.size : placement.size;
+    const density = cardDensityForSize(size);
     return [{
       id: placement.id,
       type: "card",
       position: placement.position,
-      width: placement.size.width,
-      height: placement.size.height,
+      width: size.width,
+      height: size.height,
+      selectable: true,
       selected: selectedPlacementIds.includes(placement.id),
-      className: (query || filterTags.length) && !matches ? "is-dimmed" : undefined,
+      className: [card.muted ? "is-muted" : "", (query || filterTags.length) && !matches ? "is-dimmed" : ""]
+        .filter(Boolean).join(" ") || undefined,
       data: {
         title: card.title,
-        bodyPreview: preview(card.body),
+        bodyPreview: preview(card.body, density.previewChars),
         cardId: card.id,
         tags: card.tags,
-        displayMode: canvas.displayMode,
+        color: card.color,
+        muted: card.muted,
+        isStart: status?.startPlacementId === placement.id,
+        isBookmarked: status?.bookmarkedPlacementIds?.has(placement.id) ?? false,
+        density,
       },
     }];
   });
@@ -140,6 +163,9 @@ export function toFlowEdges(
   canvas: FlowEdgeCanvas,
   selectedEdgeId: string | null,
   visiblePlacementIds?: Set<string>,
+  resizePreview?: CardSizePreview,
+  mutedCardIds?: Set<string>,
+  dimmedPlacementIds?: Set<string>,
 ): FlowEdge[] {
   const hiddenAreas = new Set(canvas.areas.filter((area) => area.collapsed).map((area) => area.id));
   const placementsById = new Map(canvas.placements.map((placement) => [placement.id, placement]));
@@ -150,21 +176,49 @@ export function toFlowEdges(
         (visiblePlacementIds && (!visiblePlacementIds.has(source.id) || !visiblePlacementIds.has(target.id))) ||
         (source.areaId && hiddenAreas.has(source.areaId)) ||
         (target.areaId && hiddenAreas.has(target.areaId))) return [];
-    const handles = connectionHandles(source, target);
+    const previewPlacement = (placement: Placement) => resizePreview?.placementId === placement.id
+      ? { ...placement, size: resizePreview.size }
+      : placement;
+    const sourcePlacement = previewPlacement(source);
+    const targetPlacement = previewPlacement(target);
+    const handles = connectionHandles(sourcePlacement, targetPlacement);
+    const sourceCenter = {
+      x: sourcePlacement.position.x + sourcePlacement.size.width / 2,
+      y: sourcePlacement.position.y + sourcePlacement.size.height / 2,
+    };
+    const targetCenter = {
+      x: targetPlacement.position.x + targetPlacement.size.width / 2,
+      y: targetPlacement.position.y + targetPlacement.size.height / 2,
+    };
+    const reverse = sourceCenter.x > targetCenter.x ||
+      (sourceCenter.x === targetCenter.x && sourceCenter.y > targetCenter.y);
+    const directionLabel = edge.direction === "undirected" ? "↔" : reverse ? "←" : "→";
+    const marker = { type: MarkerType.ArrowClosed, color: edge.id === selectedEdgeId ? "var(--accent)" : "var(--edge)" };
     return [{
       id: edge.id,
       source: edge.sourcePlacementId,
       target: edge.targetPlacementId,
       sourceHandle: handles.sourceHandle,
       targetHandle: handles.targetHandle,
-      label: edge.label,
+      label: `${directionLabel}${edge.label ? `  ${edge.label}` : ""}`,
       type: "smoothstep",
+      selectable: true,
       selected: edge.id === selectedEdgeId,
-      markerEnd: edge.direction === "directed" ? { type: MarkerType.ArrowClosed } : undefined,
-      style: { strokeWidth: 1.6 },
-      labelStyle: { fontSize: 12, fontWeight: 600 },
-      labelBgPadding: [6, 4],
-      labelBgBorderRadius: 3,
+      className: [
+        mutedCardIds?.has(source.cardId) || mutedCardIds?.has(target.cardId) ? "is-muted" : "",
+        dimmedPlacementIds?.has(source.id) || dimmedPlacementIds?.has(target.id) ? "is-dimmed" : "",
+      ].filter(Boolean).join(" ") || undefined,
+      markerStart: edge.direction === "undirected" ? marker : undefined,
+      markerEnd: marker,
+      style: {
+        strokeWidth: 1.8,
+        strokeDasharray: edge.lineStyle === "dashed" ? "8 6" : edge.lineStyle === "dotted" ? "1 6" : undefined,
+        strokeLinecap: edge.lineStyle === "dotted" ? "round" : undefined,
+      },
+      labelStyle: { fontSize: 12, fontWeight: 700, fill: "var(--ink)" },
+      labelBgStyle: { fill: "var(--panel)", stroke: "var(--line)", strokeWidth: 0.8 },
+      labelBgPadding: [8, 5],
+      labelBgBorderRadius: 4,
     }];
   });
 }

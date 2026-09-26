@@ -27,6 +27,8 @@ export interface Card {
   title: string;
   body: string;
   tags: string[];
+  color: string;
+  muted: boolean;
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
 }
@@ -44,6 +46,7 @@ export interface Placement {
 }
 
 export type EdgeDirection = "directed" | "undirected";
+export type EdgeLineStyle = "solid" | "dashed" | "dotted";
 
 export interface Edge {
   id: EdgeId;
@@ -52,6 +55,7 @@ export interface Edge {
   targetPlacementId: PlacementId;
   label: string;
   direction: EdgeDirection;
+  lineStyle: EdgeLineStyle;
 }
 
 export interface Area {

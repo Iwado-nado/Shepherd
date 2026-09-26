@@ -1,16 +1,19 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Background,
   BackgroundVariant,
   ConnectionMode,
+  SelectionMode,
   Controls,
   MiniMap,
   ReactFlow,
   ViewportPortal,
   type Connection,
+  type EdgeChange,
   type NodeChange,
   type OnNodeDrag,
   type OnSelectionChangeParams,
+  type ReactFlowInstance,
   type Viewport,
 } from "@xyflow/react";
 import { containsPoint, getAreaBounds } from "../../domain/area";
@@ -18,7 +21,20 @@ import { getActiveCanvas, useAppStore } from "../../store/appStore";
 import { AreaNode } from "./AreaNode";
 import { CardNode } from "./CardNode";
 import { toFlowEdges, toFlowNodes, type ShepherdFlowNode } from "./flowAdapter";
+import {
+  MULTI_SELECTION_KEY_CODES,
+  selectionAfterEdgeChanges,
+  selectionAfterNodeChanges,
+  selectionFromFlowElements,
+} from "./flowSelection";
+import { activateNodeByDoubleClick } from "./nodeInteractions";
 import { CARD_DRAG_TYPE } from "../project/dragTypes";
+import { canCreateRightDragEdge, exceedsRightDragThreshold } from "./rightDragConnection";
+import { createCardOnBackgroundDoubleClick } from "./canvasDoubleClick";
+import { itemColorValue } from "../colorPresets";
+import { useTheme } from "../../app/theme";
+import { resizeCardFromPointer, type CardSize } from "../../domain/cardSize";
+import type { CardSizePreview } from "./flowAdapter";
 
 const nodeTypes = { card: CardNode, area: AreaNode };
 const snapGrid: [number, number] = [16, 16];
@@ -26,18 +42,46 @@ const panButtons = [1, 2];
 const emptySelectionIds: string[] = [];
 const ALIGNMENT_THRESHOLD = 7;
 
+interface RightConnectionDrag {
+  pointerId: number;
+  sourceId: string;
+  startClient: { x: number; y: number };
+  startCanvas: { x: number; y: number };
+  active: boolean;
+}
+
+interface RightConnectionPreview {
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+}
+
+interface CardResizeDrag {
+  pointerId: number;
+  canvasId: string;
+  placementId: string;
+  start: { x: number; y: number };
+  size: CardSize;
+  zoom: number;
+}
+
 function miniMapNodeColor(node: ShepherdFlowNode): string {
-  return node.type === "area" ? String(node.data.color) : "#d4f35d";
+  return node.type === "area" ? "var(--area-outline)" : node.selected ? "var(--accent)"
+    : node.data.muted ? "var(--line)" : node.data.color !== "default" ? itemColorValue(node.data.color) : "var(--edge)";
 }
 
 export function CanvasView() {
+  const { resolvedTheme } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
+  const flowInstanceRef = useRef<ReactFlowInstance<ShepherdFlowNode> | null>(null);
   const canvas = useAppStore(getActiveCanvas);
   const cards = useAppStore((state) => state.projectFile.project.cards);
+  const start = useAppStore((state) => state.projectFile.project.start);
+  const bookmarks = useAppStore((state) => state.projectFile.project.bookmarks);
   const selection = useAppStore((state) => state.selection);
   const viewportNonce = useAppStore((state) => state.viewportNonce);
   const searchMode = useAppStore((state) => state.searchMode);
   const searchQuery = useAppStore((state) => state.searchQuery);
+  const sidebarSearchQuery = useAppStore((state) => state.sidebarSearchQuery);
   const activeTag = useAppStore((state) => state.activeTag);
   const filterTags = useAppStore((state) => state.filterTags);
   const filterBehavior = useAppStore((state) => state.filterBehavior);
@@ -49,25 +93,45 @@ export function CanvasView() {
   const moveArea = useAppStore((state) => state.moveArea);
   const toggleArea = useAppStore((state) => state.toggleArea);
   const createEdge = useAppStore((state) => state.createEdge);
+  const createCardAt = useAppStore((state) => state.createCardAt);
+  const resizePlacement = useAppStore((state) => state.resizePlacement);
   const placeExistingCard = useAppStore((state) => state.placeExistingCard);
+  const openStoryEditor = useAppStore((state) => state.openStoryEditor);
   const dragPositionsRef = useRef(new Map<string, { x: number; y: number }>());
+  const rightConnectionRef = useRef<RightConnectionDrag | null>(null);
+  const cardResizeRef = useRef<CardResizeDrag | null>(null);
+  const suppressContextMenuRef = useRef(false);
   const [altPressed, setAltPressed] = useState(false);
   const [highlightAreaId, setHighlightAreaId] = useState<string | null>(null);
   const [guides, setGuides] = useState<{ x?: number; y?: number }>({});
   const [cardDragOver, setCardDragOver] = useState(false);
-  const deferredQuery = useDeferredValue(searchMode === "canvas" ? searchQuery : "");
+  const [rightConnectionPreview, setRightConnectionPreview] = useState<RightConnectionPreview | null>(null);
+  const [cardResizePreview, setCardResizePreview] = useState<(CardSizePreview & { canvasId: string }) | null>(null);
+  const deferredQuery = useDeferredValue(sidebarSearchQuery || (searchMode === "canvas" ? searchQuery : ""));
   const effectiveTags = useMemo(
     () => [...new Set([...(activeTag ? [activeTag] : []), ...filterTags])],
     [activeTag, filterTags],
   );
+  const effectiveFilterBehavior = sidebarSearchQuery.trim() ||
+    (searchMode === "canvas" && searchQuery.trim()) || effectiveTags.length ? "dim" : filterBehavior;
+  const mutedCardIds = useMemo(() => new Set(cards.filter((card) => card.muted).map((card) => card.id)), [cards]);
+  const cardStatus = useMemo(() => ({
+    startPlacementId: start && start.canvasId === canvas?.id ? start.placementId : null,
+    bookmarkedPlacementIds: new Set(bookmarks.flatMap((bookmark) =>
+      bookmark.canvasId === canvas?.id && bookmark.targetPlacementId ? [bookmark.targetPlacementId] : [])),
+  }), [bookmarks, canvas?.id, start?.canvasId, start?.placementId]);
   const selectedPlacementIds = selection?.type === "placements" ? selection.ids : emptySelectionIds;
+  const selectedPlacement = selectedPlacementIds.length === 1
+    ? canvas?.placements.find((placement) => placement.id === selectedPlacementIds[0])
+    : undefined;
+  const resizePreview = cardResizePreview && cardResizePreview.canvasId === canvas?.id &&
+    selectedPlacement?.id === cardResizePreview.placementId ? cardResizePreview : undefined;
   const selectedAreaId = selection?.type === "area" ? selection.id : null;
   const selectedEdgeId = selection?.type === "edge" ? selection.id : null;
   const nodeCanvas = useMemo(() => canvas ? {
     areas: canvas.areas,
-    displayMode: canvas.displayMode,
     placements: canvas.placements,
-  } : null, [canvas?.areas, canvas?.displayMode, canvas?.placements]);
+  } : null, [canvas?.areas, canvas?.placements]);
   const edgeCanvas = useMemo(() => canvas ? {
     areas: canvas.areas,
     edges: canvas.edges,
@@ -83,20 +147,27 @@ export function CanvasView() {
       deferredQuery,
       effectiveTags,
       tagFilterMode,
-      filterBehavior,
+      effectiveFilterBehavior,
+      resizePreview,
+      cardStatus,
     ) : [],
-    [cards, deferredQuery, effectiveTags, filterBehavior, nodeCanvas, selectedAreaId, selectedPlacementIds, tagFilterMode],
+    [cardStatus, cards, deferredQuery, effectiveFilterBehavior, effectiveTags, nodeCanvas, resizePreview, selectedAreaId, selectedPlacementIds, tagFilterMode],
   );
   const nodes = domainNodes;
+  const dimmedPlacementIds = useMemo(() => new Set(domainNodes.flatMap((node) =>
+    node.type === "card" && node.className?.includes("is-dimmed") ? [node.id] : [])), [domainNodes]);
   const edges = useMemo(
     () => edgeCanvas ? toFlowEdges(
       edgeCanvas,
       selectedEdgeId,
-      filterBehavior === "hide"
+      effectiveFilterBehavior === "hide"
         ? new Set(domainNodes.filter((node) => node.type === "card").map((node) => node.id))
         : undefined,
+      resizePreview,
+      mutedCardIds,
+      dimmedPlacementIds,
     ) : [],
-    [domainNodes, edgeCanvas, filterBehavior, selectedEdgeId],
+    [dimmedPlacementIds, domainNodes, edgeCanvas, effectiveFilterBehavior, mutedCardIds, resizePreview, selectedEdgeId],
   );
   const renderedNodes = useMemo(
     () => nodes.map((node) => node.type === "area" && node.id === highlightAreaId
@@ -141,6 +212,17 @@ export function CanvasView() {
         dragPositionsRef.current.set(change.id, change.position);
       }
     }
+    const state = useAppStore.getState();
+    state.setSelection(selectionAfterNodeChanges(state.selection, nodesRef.current, changes));
+  }, []);
+
+  const handleEdgesChange = useCallback((changes: EdgeChange[]) => {
+    const state = useAppStore.getState();
+    state.setSelection(selectionAfterEdgeChanges(state.selection, changes));
+  }, []);
+
+  const handleEdgeClick = useCallback((event: React.MouseEvent, edge: { id: string }) => {
+    if (!event.ctrlKey && !event.metaKey) useAppStore.getState().setSelection({ type: "edge", id: edge.id });
   }, []);
 
   const findDropArea = useCallback((node: ShepherdFlowNode): string | null => {
@@ -187,13 +269,8 @@ export function CanvasView() {
   }, []);
 
   const handleSelection = useCallback(({ nodes: selectedNodes, edges: selectedEdges }: OnSelectionChangeParams) => {
-    const placementIds = selectedNodes.filter((node) => node.type === "card").map((node) => node.id);
-    const area = selectedNodes.find((node) => node.type === "area");
-    if (placementIds.length) setSelection({ type: "placements", ids: placementIds });
-    else if (area) setSelection({ type: "area", id: area.id });
-    else if (selectedEdges[0]) setSelection({ type: "edge", id: selectedEdges[0].id });
-    else setSelection(null);
-  }, [setSelection]);
+    selectionRef.current = selectionFromFlowElements(selectedNodes as ShepherdFlowNode[], selectedEdges);
+  }, []);
 
   const handleNodeDrag = useCallback<OnNodeDrag<ShepherdFlowNode>>((_, node) => {
     updateGuides(node);
@@ -226,9 +303,12 @@ export function CanvasView() {
     dragPositionsRef.current.clear();
   }, [findDropArea, moveArea, movePlacements]);
 
-  const handleNodeDoubleClick = useCallback((_: React.MouseEvent, node: ShepherdFlowNode) => {
-    if (node.type === "area") toggleArea(node.id);
-  }, [toggleArea]);
+  const handleNodeDoubleClick = useCallback((event: React.MouseEvent, node: ShepherdFlowNode) => {
+    if (event.target instanceof Element && event.target.closest(".react-flow__handle")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    activateNodeByDoubleClick(node, openStoryEditor, toggleArea);
+  }, [openStoryEditor, toggleArea]);
 
   const handleConnect = useCallback((connection: Connection) => {
     if (connection.source && connection.target) createEdge(connection.source, connection.target);
@@ -239,7 +319,130 @@ export function CanvasView() {
     if (currentCanvas) updateViewport(currentCanvas.id, viewport);
   }, [updateViewport]);
 
-  const handlePaneClick = useCallback(() => setSelection(null), [setSelection]);
+  const handleBackgroundDoubleClick = useCallback((event: React.MouseEvent) => {
+    const instance = flowInstanceRef.current;
+    if (instance) createCardOnBackgroundDoubleClick(event, instance.screenToFlowPosition, createCardAt);
+  }, [createCardAt]);
+
+  const startCardResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0 || !canvas || !selectedPlacement) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    cardResizeRef.current = {
+      pointerId: event.pointerId,
+      canvasId: canvas.id,
+      placementId: selectedPlacement.id,
+      start: { x: event.clientX, y: event.clientY },
+      size: { ...selectedPlacement.size },
+      zoom: flowInstanceRef.current?.getViewport().zoom ?? canvas.viewport.zoom,
+    };
+  };
+
+  const moveCardResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const drag = cardResizeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const size = resizeCardFromPointer(drag.size, drag.start, { x: event.clientX, y: event.clientY }, drag.zoom);
+    setCardResizePreview((previous) => previous?.placementId === drag.placementId &&
+      previous.size.width === size.width && previous.size.height === size.height
+      ? previous
+      : { canvasId: drag.canvasId, placementId: drag.placementId, size });
+  };
+
+  const finishCardResize = (event: ReactPointerEvent<HTMLButtonElement>, cancelled = false) => {
+    const drag = cardResizeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    cardResizeRef.current = null;
+    setCardResizePreview(null);
+    if (!cancelled && canvasRef.current?.id === drag.canvasId) {
+      resizePlacement(drag.placementId, resizeCardFromPointer(
+        drag.size, drag.start, { x: event.clientX, y: event.clientY }, drag.zoom,
+      ));
+    }
+  };
+
+  const cardPlacementIdAt = useCallback((target: EventTarget | null) => {
+    if (!(target instanceof Element)) return null;
+    const placementId = target.closest<HTMLElement>(".react-flow__node")?.dataset.id ?? null;
+    const currentCanvas = canvasRef.current;
+    return placementId && currentCanvas?.placements.some((placement) => placement.id === placementId)
+      ? placementId
+      : null;
+  }, []);
+
+  const handleRightPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 2) return;
+    suppressContextMenuRef.current = false;
+    const sourceId = cardPlacementIdAt(event.target);
+    if (!sourceId || !(event.target instanceof Element)) return;
+    const sourceElement = event.target.closest<HTMLElement>(".react-flow__node");
+    if (!sourceElement) return;
+    const stageBounds = event.currentTarget.getBoundingClientRect();
+    const sourceBounds = sourceElement.getBoundingClientRect();
+    rightConnectionRef.current = {
+      pointerId: event.pointerId,
+      sourceId,
+      startClient: { x: event.clientX, y: event.clientY },
+      startCanvas: {
+        x: sourceBounds.right - stageBounds.left,
+        y: sourceBounds.top + sourceBounds.height / 2 - stageBounds.top,
+      },
+      active: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+  }, [cardPlacementIdAt]);
+
+  const handleRightPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = rightConnectionRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.active && exceedsRightDragThreshold(drag.startClient, { x: event.clientX, y: event.clientY })) {
+      drag.active = true;
+    }
+    if (drag.active) {
+      const stageBounds = event.currentTarget.getBoundingClientRect();
+      setRightConnectionPreview({
+        start: drag.startCanvas,
+        end: { x: event.clientX - stageBounds.left, y: event.clientY - stageBounds.top },
+      });
+      event.preventDefault();
+    }
+    event.stopPropagation();
+  }, []);
+
+  const finishRightConnection = useCallback((event: ReactPointerEvent<HTMLDivElement>, cancelled = false) => {
+    const drag = rightConnectionRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const targetId = cancelled ? null : cardPlacementIdAt(document.elementFromPoint(event.clientX, event.clientY));
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    rightConnectionRef.current = null;
+    setRightConnectionPreview(null);
+    if (drag.active) {
+      suppressContextMenuRef.current = true;
+      event.preventDefault();
+      const currentCanvas = canvasRef.current;
+      if (currentCanvas && canCreateRightDragEdge(currentCanvas, drag.sourceId, targetId)) {
+        createEdge(drag.sourceId, targetId);
+      }
+    }
+    event.stopPropagation();
+  }, [cardPlacementIdAt, createEdge]);
+
+  const handleContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (!suppressContextMenuRef.current && !rightConnectionRef.current?.active) return;
+    suppressContextMenuRef.current = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, []);
 
   if (!canvas) return <div className="canvas-empty">Canvasを読み込めませんでした。</div>;
 
@@ -247,6 +450,11 @@ export function CanvasView() {
     <div
       className={`canvas-stage${cardDragOver ? " is-card-drag-over" : ""}`}
       ref={containerRef}
+      onPointerDownCapture={handleRightPointerDown}
+      onPointerMoveCapture={handleRightPointerMove}
+      onPointerUpCapture={(event) => finishRightConnection(event)}
+      onPointerCancelCapture={(event) => finishRightConnection(event, true)}
+      onContextMenuCapture={handleContextMenu}
       onDragEnter={(event) => {
         if (event.dataTransfer.types.includes(CARD_DRAG_TYPE)) setCardDragOver(true);
       }}
@@ -276,29 +484,36 @@ export function CanvasView() {
         edges={edges}
         nodeTypes={nodeTypes}
         defaultViewport={canvas.viewport}
+        onInit={(instance) => { flowInstanceRef.current = instance; }}
         minZoom={0.2}
         maxZoom={2.5}
         onNodesChange={handleNodesChange}
+        onEdgesChange={handleEdgesChange}
+        onEdgeClick={handleEdgeClick}
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onNodeDoubleClick={handleNodeDoubleClick}
         onConnect={handleConnect}
+        onDoubleClick={handleBackgroundDoubleClick}
         connectionMode={ConnectionMode.Loose}
         onSelectionChange={handleSelection}
         onMoveEnd={handleMoveEnd}
-        onPaneClick={handlePaneClick}
+        onPaneClick={() => setSelection(null)}
         deleteKeyCode={null}
-        multiSelectionKeyCode="Shift"
+        elementsSelectable
+        multiSelectionKeyCode={MULTI_SELECTION_KEY_CODES}
         selectionOnDrag
+        selectionMode={SelectionMode.Partial}
         panActivationKeyCode="Space"
         panOnDrag={panButtons}
         snapToGrid={!altPressed}
         snapGrid={snapGrid}
         zoomOnDoubleClick={false}
         fitView={false}
-        colorMode="dark"
+        colorMode={resolvedTheme}
+        defaultMarkerColor="var(--edge)"
       >
-        <Background color="#54584d" gap={28} size={1} variant={BackgroundVariant.Dots} />
+        <Background color="var(--grid-dot)" gap={28} size={1} variant={BackgroundVariant.Dots} />
         <MiniMap
           pannable
           zoomable
@@ -309,8 +524,42 @@ export function CanvasView() {
         <ViewportPortal>
           {guides.x !== undefined ? <div className="alignment-guide vertical" style={{ left: guides.x }} /> : null}
           {guides.y !== undefined ? <div className="alignment-guide horizontal" style={{ top: guides.y }} /> : null}
+          {selectedPlacement && renderedNodes.some((node) => node.type === "card" && node.id === selectedPlacement.id) ? (
+            <div
+              className="card-resize-frame"
+              style={{
+                left: selectedPlacement.position.x,
+                top: selectedPlacement.position.y,
+                width: resizePreview?.size.width ?? selectedPlacement.size.width,
+                height: resizePreview?.size.height ?? selectedPlacement.size.height,
+              }}
+            >
+              <button
+                className="card-resize-handle nodrag nopan nokey"
+                type="button"
+                aria-label="Cardのサイズを変更"
+                title="ドラッグしてCardをリサイズ"
+                onPointerDown={startCardResize}
+                onPointerMove={moveCardResize}
+                onPointerUp={(event) => finishCardResize(event)}
+                onPointerCancel={(event) => finishCardResize(event, true)}
+                onClick={(event) => event.stopPropagation()}
+                onDoubleClick={(event) => event.stopPropagation()}
+              />
+            </div>
+          ) : null}
         </ViewportPortal>
       </ReactFlow>
+      {rightConnectionPreview ? (
+        <svg className="right-connection-preview" aria-hidden="true">
+          <line
+            x1={rightConnectionPreview.start.x}
+            y1={rightConnectionPreview.start.y}
+            x2={rightConnectionPreview.end.x}
+            y2={rightConnectionPreview.end.y}
+          />
+        </svg>
+      ) : null}
       <div className="canvas-caption">
         <span>{canvas.title}</span>
         <small>{altPressed ? "Free move" : "16px snap"}</small>

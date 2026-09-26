@@ -3,9 +3,11 @@ import { message, open, save } from "@tauri-apps/plugin-dialog";
 import type { ProjectFile } from "../../domain/models";
 import { parseProjectFile, serializeProjectFile } from "../../domain/projectFile";
 import { useAppStore } from "../../store/appStore";
+import { commitFocusedEditor } from "../editor/focusedEditor";
 
 const PROJECT_FILTER = [{ name: "Shepherd Project", extensions: ["storyflow"] }];
 const RECOVERY_FORMAT_VERSION = 1;
+const DISCARD_BUTTONS = { yes: "保存", no: "保存せず続行", cancel: "キャンセル" } as const;
 
 export interface RecoveryDocument {
   formatVersion: 1;
@@ -166,7 +168,12 @@ async function chooseSavePath(): Promise<string | null> {
 }
 
 export async function saveProject(forceSaveAs = false, commitEditor = true): Promise<void> {
-  if (commitEditor) document.activeElement instanceof HTMLElement && document.activeElement.blur();
+  if (commitEditor) {
+    commitFocusedEditor();
+    if (typeof document !== "undefined") {
+      document.activeElement instanceof HTMLElement && document.activeElement.blur();
+    }
+  }
   invalidateRecoveryWrites();
   const beforeChoice = useAppStore.getState();
   const needsPath = forceSaveAs || !beforeChoice.currentFilePath;
@@ -212,11 +219,12 @@ export async function saveProject(forceSaveAs = false, commitEditor = true): Pro
   }
 }
 
-export async function autosaveRecovery(): Promise<void> {
+export async function autosaveRecovery(force = false): Promise<void> {
+  const beforeCommit = useAppStore.getState();
+  if ((!force && beforeCommit.autoSavePaused) || (!force && beforeCommit.saveState === "saving")) return;
+  commitFocusedEditor();
   const state = useAppStore.getState();
   if (
-    state.autoSavePaused ||
-    state.saveState === "saving" ||
     (!state.contentDirty && !state.workspaceDirty) ||
     (state.autosavedRevision === state.currentRevision &&
       state.autosavedWorkspaceRevision === state.workspaceRevision)
@@ -246,6 +254,11 @@ export async function autosaveRecovery(): Promise<void> {
         }
         return;
       }
+      const current = useAppStore.getState();
+      if (force && !current.contentDirty && !current.workspaceDirty) {
+        current.setAutosaveState("idle");
+        return;
+      }
       await invoke("write_recovery_file", {
         projectId,
         contents: JSON.stringify(document, null, 2),
@@ -261,18 +274,34 @@ export async function autosaveRecovery(): Promise<void> {
   }
 }
 
+export async function completeCloseRequest(destroy: () => Promise<void>): Promise<boolean> {
+  useAppStore.getState().setAutoSavePaused(true);
+  try {
+    if (!(await confirmDiscardChanges())) {
+      useAppStore.getState().setAutoSavePaused(false);
+      return false;
+    }
+    await autosaveRecovery(true);
+    await destroy();
+    return true;
+  } catch (error) {
+    useAppStore.getState().setAutoSavePaused(false);
+    throw error;
+  }
+}
+
 export async function confirmDiscardChanges(): Promise<boolean> {
+  commitFocusedEditor();
   const state = useAppStore.getState();
   if (!state.contentDirty && !state.workspaceDirty) return true;
   const shouldSave = await message("変更を保存しますか？", {
     title: "Shepherd",
     kind: "warning",
-    buttons: { yes: "保存", no: "保存せず続行", cancel: "キャンセル" },
+    buttons: DISCARD_BUTTONS,
   });
-  if (shouldSave === "Cancel") return false;
-  if (shouldSave === "Yes") {
+  if (shouldSave === DISCARD_BUTTONS.yes || shouldSave === "Yes") {
     await saveProject(false);
     return useAppStore.getState().saveState !== "error" && Boolean(useAppStore.getState().currentFilePath);
   }
-  return true;
+  return shouldSave === DISCARD_BUTTONS.no || shouldSave === "No";
 }

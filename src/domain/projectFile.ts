@@ -1,5 +1,7 @@
 import {
   FORMAT_VERSION,
+  CARD_HEIGHT,
+  CARD_WIDTH,
   type Area,
   type Bookmark,
   type CanvasData,
@@ -10,6 +12,7 @@ import {
   type StartPoint,
   type Viewport,
 } from "./models";
+import { normalizeLegacyEdges } from "./edges";
 
 export class ProjectFileError extends Error {
   constructor(message: string) {
@@ -80,6 +83,8 @@ function readCard(value: unknown, index: number, legacy: boolean): Card {
     title: requireString(item.title, `${path}.title`),
     body: requireString(item.body, `${path}.body`),
     tags: legacy ? [] : readStrings(item.tags, `${path}.tags`),
+    color: item.color === undefined ? "default" : requireNonEmptyString(item.color, `${path}.color`),
+    muted: item.muted === undefined ? false : requireBoolean(item.muted, `${path}.muted`),
     createdAt: requireNonEmptyString(item.createdAt, `${path}.createdAt`),
     updatedAt: requireNonEmptyString(item.updatedAt, `${path}.updatedAt`),
   };
@@ -94,9 +99,9 @@ function readPlacement(
   const path = `project.canvases[${canvasIndex}].placements[${index}]`;
   const item = requireRecord(value, path);
   const position = requireRecord(item.position, `${path}.position`);
-  const size = requireRecord(item.size, `${path}.size`);
-  const width = requireNumber(size.width, `${path}.size.width`);
-  const height = requireNumber(size.height, `${path}.size.height`);
+  const size = item.size === undefined ? {} : requireRecord(item.size, `${path}.size`);
+  const width = size.width === undefined ? CARD_WIDTH : requireNumber(size.width, `${path}.size.width`);
+  const height = size.height === undefined ? CARD_HEIGHT : requireNumber(size.height, `${path}.size.height`);
   if (width <= 0 || height <= 0) {
     throw new ProjectFileError(`${path}.size must be greater than zero.`);
   }
@@ -123,6 +128,12 @@ function readEdge(value: unknown, canvasIndex: number, index: number): Edge {
   if (direction !== "directed" && direction !== "undirected") {
     throw new ProjectFileError(`${path}.direction is not supported.`);
   }
+  const lineStyle = item.lineStyle === undefined
+    ? "solid"
+    : requireString(item.lineStyle, `${path}.lineStyle`);
+  if (lineStyle !== "solid" && lineStyle !== "dashed" && lineStyle !== "dotted") {
+    throw new ProjectFileError(`${path}.lineStyle is not supported.`);
+  }
   return {
     id: requireNonEmptyString(item.id, `${path}.id`),
     canvasId: requireNonEmptyString(item.canvasId, `${path}.canvasId`),
@@ -130,6 +141,7 @@ function readEdge(value: unknown, canvasIndex: number, index: number): Edge {
     targetPlacementId: requireNonEmptyString(item.targetPlacementId, `${path}.targetPlacementId`),
     label: requireString(item.label, `${path}.label`),
     direction,
+    lineStyle,
   };
 }
 
@@ -336,7 +348,16 @@ export function parseProjectFile(source: string): ProjectFile {
   };
 
   assertInvariants(result);
-  return result;
+  return {
+    ...result,
+    project: {
+      ...result.project,
+      canvases: result.project.canvases.map((canvas) => ({
+        ...canvas,
+        edges: normalizeLegacyEdges(canvas.edges),
+      })),
+    },
+  };
 }
 
 export function serializeProjectFile(file: ProjectFile): string {

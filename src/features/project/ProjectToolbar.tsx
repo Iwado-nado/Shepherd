@@ -1,54 +1,50 @@
 import { useState } from "react";
 import { useAppStore } from "../../store/appStore";
+import { useTheme } from "../../app/theme";
 import { ExportDialog } from "../export/ExportDialog";
 import { RecoveryChoiceDialog } from "./RecoveryChoiceDialog";
 import { SaveHistoryDialog } from "./SaveHistoryDialog";
 import { createNewProject, openProject, saveProject, type PendingProjectOpen } from "./projectPersistence";
+import shepherdIconUrl from "../../../assets/shepherd_Icon_透過.svg?url";
+
+type ToolbarIconName = "card" | "area" | "start" | "bookmark" | "save" | "export";
+
+function ToolbarIcon({ name }: { name: ToolbarIconName }) {
+  return (
+    <svg className="toolbar-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {name === "card" ? <><rect x="2.5" y="3" width="15" height="14" rx="2" /><path d="M6 7h8M6 10h6M6 13h4" /></> : null}
+      {name === "area" ? <><path d="M3 4h14v12H3z" strokeDasharray="2 2" /><path d="M7 10h6M10 7v6" /></> : null}
+      {name === "start" ? <path d="m10 2 2.4 5.2 5.6.7-4.1 3.9 1.1 5.5-5-2.7-5 2.7 1.1-5.5L2 7.9l5.6-.7z" fill="currentColor" stroke="none" /> : null}
+      {name === "bookmark" ? <path d="M5 2.5h10v15l-5-3.5-5 3.5z" /> : null}
+      {name === "save" ? <><path d="M3 2.5h12l2 2V17.5H3z" /><path d="M6 2.5v5h8v-5M6 17.5v-6h8v6" /></> : null}
+      {name === "export" ? <><path d="M11 3h6v6M17 3l-9 9" /><path d="M15 12v5H3V5h5" /></> : null}
+    </svg>
+  );
+}
 
 export function ProjectToolbar() {
+  const { preference, setPreference } = useTheme();
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [pendingOpen, setPendingOpen] = useState<PendingProjectOpen | null>(null);
-  const title = useAppStore((state) => state.projectFile.project.title);
   const hasStart = useAppStore((state) => Boolean(state.projectFile.project.start));
-  const canSetStart = useAppStore((state) => state.selection?.type === "placements" && state.selection.ids.length === 1);
   const contentDirty = useAppStore((state) => state.contentDirty);
   const workspaceDirty = useAppStore((state) => state.workspaceDirty);
+  const focusedEditorDirty = useAppStore((state) => Boolean(state.storyEditor?.dirty));
   const currentFilePath = useAppStore((state) => state.currentFilePath);
   const saveState = useAppStore((state) => state.saveState);
   const autosaveState = useAppStore((state) => state.autosaveState);
   const lastAutosavedAt = useAppStore((state) => state.lastAutosavedAt);
-  const pastCount = useAppStore((state) => state.past.length);
-  const futureCount = useAppStore((state) => state.future.length);
   const createCard = useAppStore((state) => state.createCardAtCenter);
   const createArea = useAppStore((state) => state.createArea);
-  const setStart = useAppStore((state) => state.setStart);
   const goToStart = useAppStore((state) => state.goToStart);
-  const openSearch = useAppStore((state) => state.openSearch);
-  const undo = useAppStore((state) => state.undo);
-  const redo = useAppStore((state) => state.redo);
-  const navigateBack = useAppStore((state) => state.navigateBack);
-  const navigateForward = useAppStore((state) => state.navigateForward);
-  const backCount = useAppStore((state) => state.navigationBack.length);
-  const forwardCount = useAppStore((state) => state.navigationForward.length);
-  const displayMode = useAppStore((state) => {
-    const id = state.projectFile.workspace.lastOpenedCanvasId;
-    return state.projectFile.project.canvases.find((canvas) => canvas.id === id)?.displayMode ?? "standard";
-  });
   const bookmarks = useAppStore((state) => state.projectFile.project.bookmarks);
   const canvases = useAppStore((state) => state.projectFile.project.canvases);
-  const filterCount = useAppStore((state) => new Set([
-    ...state.filterTags,
-    ...(state.activeTag ? [state.activeTag] : []),
-  ]).size);
-  const setDisplayMode = useAppStore((state) => state.setDisplayMode);
-  const toggleFilterPanel = useAppStore((state) => state.toggleFilterPanel);
-  const addBookmark = useAppStore((state) => state.addBookmark);
-  const deleteBookmark = useAppStore((state) => state.deleteBookmark);
   const goToBookmark = useAppStore((state) => state.goToBookmark);
 
-  const dirty = contentDirty || workspaceDirty || !currentFilePath;
+  const dirty = contentDirty || workspaceDirty || focusedEditorDirty || !currentFilePath;
   const status = saveState === "saving"
     ? "Saving..."
     : autosaveState === "saving"
@@ -59,46 +55,43 @@ export function ProjectToolbar() {
 
   return (
     <header className="project-toolbar">
-      <div className="brand-block"><span className="brand-mark">S</span><div><strong>SHEPHERD</strong><span>{title}</span></div></div>
+      <div className="brand-block">
+        <button className="brand-mark" type="button" aria-label="Project menu" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((open) => !open)}>
+          <img src={shepherdIconUrl} alt="" aria-hidden="true" />
+        </button>
+        <div><strong>SHEPHERD</strong></div>
+      </div>
       <nav className="toolbar-actions" aria-label="Project actions">
-        <button type="button" onClick={() => void createNewProject()}>New</button>
-        <button type="button" onClick={() => void openProject().then((pending) => setPendingOpen(pending))}>Open</button>
-        <button type="button" onClick={() => void saveProject()}>Save</button>
-        <button type="button" onClick={() => void saveProject(true)}>Save As</button>
-        <button type="button" onClick={() => setHistoryOpen(true)}>History</button>
-        <span className="toolbar-rule" />
-        <button className="primary-button" type="button" onClick={createCard}>+ Card</button>
-        <button type="button" onClick={createArea}>+ Area</button>
-        <button type="button" className={displayMode === "compact" ? "is-active" : ""} onClick={() => setDisplayMode(displayMode === "compact" ? "standard" : "compact")}>{displayMode === "compact" ? "Compact" : "Standard"}</button>
-        <span className="toolbar-rule" />
-        <button type="button" disabled={!canSetStart} onClick={setStart}>Set START</button>
-        <button type="button" disabled={!hasStart} onClick={goToStart}>★ START</button>
-        <button type="button" disabled={backCount === 0} onClick={navigateBack} title="Back (Alt+Left)">←</button>
-        <button type="button" disabled={forwardCount === 0} onClick={navigateForward} title="Forward (Alt+Right)">→</button>
-        <button type="button" onClick={() => setBookmarksOpen((open) => !open)}>Bookmarks</button>
-        <span className="toolbar-rule" />
-        <button type="button" onClick={() => openSearch("canvas")}>Find</button>
-        <button type="button" onClick={() => openSearch("project")}>Search</button>
-        <button type="button" className={filterCount ? "is-active" : ""} onClick={toggleFilterPanel}>Filter{filterCount ? ` ${filterCount}` : ""}</button>
-        <button type="button" onClick={() => setExportOpen(true)}>Export</button>
-        <span className="toolbar-rule" />
-        <button type="button" onClick={undo} disabled={pastCount === 0} title="Undo (Ctrl/Cmd+Z)">Undo</button>
-        <button type="button" onClick={redo} disabled={futureCount === 0} title="Redo (Ctrl/Cmd+Shift+Z)">Redo</button>
+        <button className="primary-button" type="button" onClick={createCard}><ToolbarIcon name="card" />Card</button>
+        <button type="button" onClick={createArea}><ToolbarIcon name="area" />Area</button>
+        <button className="special-action start-action" type="button" disabled={!hasStart} onClick={goToStart}><ToolbarIcon name="start" />START</button>
+        <button className="special-action" type="button" onClick={() => setBookmarksOpen((open) => !open)}><ToolbarIcon name="bookmark" />Bookmarks</button>
+        <button type="button" onClick={() => void saveProject()}><ToolbarIcon name="save" />Save</button>
+        <button type="button" onClick={() => setExportOpen(true)}><ToolbarIcon name="export" />Export</button>
       </nav>
+      <select className="theme-select" aria-label="Theme" value={preference} onChange={(event) => setPreference(event.target.value as typeof preference)}>
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
       <div className={`save-indicator ${dirty ? "is-dirty" : ""}`}><span />{status}</div>
+      {projectMenuOpen ? (
+        <section className="project-menu" aria-label="Project menu" onKeyDown={(event) => { if (event.key === "Escape") setProjectMenuOpen(false); }}>
+          <button type="button" onClick={() => { setProjectMenuOpen(false); void createNewProject(); }}>New</button>
+          <button type="button" onClick={() => { setProjectMenuOpen(false); void openProject().then(setPendingOpen); }}>Open</button>
+          <button type="button" onClick={() => { setProjectMenuOpen(false); void saveProject(true); }}>Save As</button>
+          <button type="button" onClick={() => { setProjectMenuOpen(false); setHistoryOpen(true); }}>History</button>
+        </section>
+      ) : null}
       {bookmarksOpen ? (
         <section className="bookmark-popover">
-          <div className="popover-heading"><span>BOOKMARKS</span><button type="button" onClick={() => {
-            const name = window.prompt("Bookmark名", `Bookmark ${bookmarks.length + 1}`);
-            if (name) addBookmark(name);
-          }}>+ Add</button></div>
+          <div className="popover-heading"><span>BOOKMARKS</span><button type="button" aria-label="Bookmarksを閉じる" onClick={() => setBookmarksOpen(false)}>×</button></div>
           {bookmarks.length ? bookmarks.map((bookmark) => (
             <div className="bookmark-row" key={bookmark.id}>
               <button type="button" onClick={() => { goToBookmark(bookmark.id); setBookmarksOpen(false); }}>
                 <strong>{bookmark.title}</strong>
                 <small>{canvases.find((canvas) => canvas.id === bookmark.canvasId)?.title}</small>
               </button>
-              <button className="bookmark-delete" type="button" onClick={() => deleteBookmark(bookmark.id)}>×</button>
             </div>
           )) : <p>Bookmarkはまだありません。</p>}
         </section>

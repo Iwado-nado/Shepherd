@@ -231,6 +231,8 @@ ID
 タイトル
 本文
 タグ
+カラー（Default + 色プリセット）
+Muted状態
 作成日時
 更新日時
 ```
@@ -238,6 +240,8 @@ ID
 Coreではタグをまだ実装せず、ID・タイトル・本文・作成日時・更新日時のみでもよい。TagはUsable MVPで追加する。
 
 任意属性システムは当面実装しない。
+
+CardカラーとMuted状態はCard本体の共通属性とし、Placementごとの位置・サイズとは分離する。Mutedは削除せず表示を弱める状態で、選択・編集・移動は可能とする。
 
 ## 6.3 タイトル
 
@@ -286,6 +290,8 @@ Cardには任意数のタグを設定できる。
 タグはProject全体で共有する。
 
 タグは検索・絞り込みに使用する。
+
+Tag入力時は確定済みTagをchipとして表示し、編集中の文字列とは区別する。カンマ・半角/全角スペースやEnterでTagを確定し、chipから解除できる。
 
 ---
 
@@ -405,6 +411,8 @@ Card完全削除UIはUsable MVP以降に実装する。
 
 Coreでは固定標準サイズのCardを使用し、タイトルと本文冒頭を表示する。Tag導入後はTagも表示できる。
 
+START・Bookmarkが指すPlacementには、Card上部の「CARD」表記の左にそれぞれ星・栞の印を表示する。印はPlacementへの参照から導出し、Card本体へ状態を重複保存しない。
+
 将来的には以下の表示モードを用意できる。
 
 ```text
@@ -440,7 +448,7 @@ Canvas ID
 接続先Placement ID
 ラベル
 方向
-表示スタイル（将来拡張）
+線種（Solid / Dashed / Dotted）
 ```
 
 ## 10.3 Edgeラベル
@@ -465,7 +473,9 @@ EdgeラベルはCoreから編集可能とする。
 
 Coreでは有向Edgeを標準とする。
 
-将来的に人物関係などで必要な場合は無向Edgeも扱えるよう、データモデル上は `directed` / `undirected` を表現できる構成としてよい。
+人物関係などで利用できるよう、`directed` / `undirected` の方向を切り替えられる。
+
+方向は矢印とEdge中央の記号（`→` / `↔`）で区別する。線種は方向と独立して保持し、既定値はSolidとする。
 
 ## 10.5 接続Handle
 
@@ -488,7 +498,8 @@ Handle位置そのものはProjectファイルへ保存しない。手動ルー�
 CoreおよびUsable MVPでは以下とする。
 
 - 同一Placementへの自己Edgeは禁止する。
-- 同じ2つのPlacement間に複数Edgeを作ることは許可する。
+- 同じ2つのPlacement間に新規作成できるEdgeは1件のみとする。同方向の再接続は無視し、逆方向の再接続は既存Edgeを双方向へ変更する。
+- 旧データの重複はラベル・線種が同じ場合に限り統合する。異なる場合はデータを失わないよう残し、新たな重複は作らない。
 - Edgeの両端Placementは必ず同一Canvasに属する。
 - EdgeはCard IDではなくPlacement IDを参照する。
 
@@ -826,7 +837,6 @@ Project全体を検索対象とする。
 検索対象：
 
 - Cardタイトル
-- Card本文
 - Cardタグ
 - Canvas名
 - Area名
@@ -834,7 +844,7 @@ Project全体を検索対象とする。
 
 ## 16.2 Command Palette
 
-Project全体の検索・移動にはCommand Palette型UIを採用する。
+左サイドバー最上部にCard検索入力を置き、プロジェクト全体／現在Canvasを切り替える。Tag Filterと併用した場合は両条件に合うCardを優先し、Canvas上の非一致Card・Areaは非表示にせずMutedに近い透明度で残す。Canvas・Area・Tag等の移動コマンドにはCommand Paletteも利用できる。
 
 例：
 
@@ -988,16 +998,14 @@ Undo / Redo履歴はProjectファイルへ永続化しない。
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ Project   +Card   START   ← →   Search       │
+│ S(menu)  Card  Area  ★ START  Bookmarks  Save  Export │
 ├──────────┬────────────────────────┬──────────┤
 │          │                        │          │
-│ CANVAS   │                        │ EDITOR   │
-│ Plot     │    Infinite Canvas     │          │
-│ People   │                        │ Title    │
-│ Timeline │                        │ Tags     │
-│          │                        │ Body     │
-│ CARDS    │                        │          │
-│          │                        │ Used In  │
+│ Search   │                        │ EDITOR   │
+│ CANVASES │    Infinite Canvas     │ Title    │
+│ └Area    │                        │ Tags     │
+│  └Card   │                        │ Body     │
+│ UNPLACED │                        │ Used In  │
 │ TAGS     │                        │          │
 │          │                        │          │
 ├──────────┴────────────────────────┴──────────┤
@@ -1010,10 +1018,10 @@ Undo / Redo履歴はProjectファイルへ永続化しない。
 主に以下を表示する。
 
 ```text
-Canvas一覧
-Project Card一覧
+Card検索（Project全体 / 現在Canvas）
+Canvas / Area / Cardの開閉可能なTree
 Unplaced Card一覧
-Tag一覧
+独立したTag Filter / 管理エリア
 ```
 
 ## 20.2 中央
@@ -1027,11 +1035,17 @@ Infinite Canvas。
 Card選択時：
 
 ```text
+START / Bookmarkの設定・解除
 タイトル
 タグ
 本文
+カラー
 配置先一覧
 ```
+
+複数Card選択時はタイトル・本文入力を表示せず、選択Cardを包含するAreaの作成とCardカラーの一括変更を行う。
+
+上部Toolbarの常設操作は Card / Area / ★ START / Bookmarks / Save / Export とする。New / Open / Save As / Historyは左上のProjectメニューへ置き、Undo / Redoはキーボードショートカットを維持する。
 
 Area選択時：
 
@@ -1294,7 +1308,7 @@ Canvas上からのDelete
 Edge作成・削除
 Edgeラベル編集
 有向Edgeを標準
-重複Edgeを許可
+同一PlacementペアのEdgeは1件とし、逆方向の再接続は双方向化
 自己Edgeを禁止
 上下左右Handleの自動選択
 
@@ -1553,6 +1567,8 @@ ProjectData {
   canvases[]
 
   tags[]?              // Usable MVP以降
+  color                 // Default / 色プリセット
+  muted                 // boolean
   startBookmarkId?     // Usable MVP以降
   bookmarks[]?         // STARTまたはPolish以降
 
@@ -1648,6 +1664,8 @@ Area {
 
 Areaは固定矩形のwidth / heightを持たない。
 
+AreaのカラーはCanvasごとにDefaultまたは落ち着いたプリセットから選ぶ。既存Projectに保存済みのHEXカラーは読み込み時に保持する。
+
 ## 28.8 Edge
 
 ```ts
@@ -1660,11 +1678,13 @@ Edge {
 
   label
   direction
+  lineStyle
 }
 ```
 
 ```ts
 EdgeDirection = "directed" | "undirected"
+EdgeLineStyle = "solid" | "dashed" | "dotted"
 ```
 
 Coreでは `directed` を標準とする。
