@@ -5,3 +5,5 @@ src-tauri/target/
 *.storyflow.tmp
 *.storyflow.backup*
 .DS_Store
+
+*:Zone.Identifier
