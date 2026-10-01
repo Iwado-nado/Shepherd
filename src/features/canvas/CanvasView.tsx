@@ -16,11 +16,11 @@ import {
   type ReactFlowInstance,
   type Viewport,
 } from "@xyflow/react";
-import { containsPoint, getAreaBounds } from "../../domain/area";
 import { getActiveCanvas, useAppStore } from "../../store/appStore";
 import { AreaNode } from "./AreaNode";
 import { CardNode } from "./CardNode";
-import { toFlowEdges, toFlowNodes, type ShepherdFlowNode } from "./flowAdapter";
+import { toFlowNodes, type ShepherdFlowNode } from "./flowAdapter";
+import { projectFlowEdges, type EdgeProjection } from "./edgeProjection";
 import {
   MULTI_SELECTION_KEY_CODES,
   selectionAfterEdgeChanges,
@@ -35,12 +35,12 @@ import { itemColorValue } from "../colorPresets";
 import { useTheme } from "../../app/theme";
 import { resizeCardFromPointer, type CardSize } from "../../domain/cardSize";
 import type { CardSizePreview } from "./flowAdapter";
+import { createDragPreview, dragDropArea, dragGuides, type DragPreview } from "./dragPreview";
 
 const nodeTypes = { card: CardNode, area: AreaNode };
 const snapGrid: [number, number] = [16, 16];
 const panButtons = [1, 2];
 const emptySelectionIds: string[] = [];
-const ALIGNMENT_THRESHOLD = 7;
 
 interface RightConnectionDrag {
   pointerId: number;
@@ -98,6 +98,8 @@ export function CanvasView() {
   const placeExistingCard = useAppStore((state) => state.placeExistingCard);
   const openStoryEditor = useAppStore((state) => state.openStoryEditor);
   const dragPositionsRef = useRef(new Map<string, { x: number; y: number }>());
+  const dragPreviewRef = useRef<DragPreview | null>(null);
+  const edgeProjectionRef = useRef<EdgeProjection | null>(null);
   const rightConnectionRef = useRef<RightConnectionDrag | null>(null);
   const cardResizeRef = useRef<CardResizeDrag | null>(null);
   const suppressContextMenuRef = useRef(false);
@@ -114,7 +116,6 @@ export function CanvasView() {
   );
   const effectiveFilterBehavior = sidebarSearchQuery.trim() ||
     (searchMode === "canvas" && searchQuery.trim()) || effectiveTags.length ? "dim" : filterBehavior;
-  const mutedCardIds = useMemo(() => new Set(cards.filter((card) => card.muted).map((card) => card.id)), [cards]);
   const cardStatus = useMemo(() => ({
     startPlacementId: start && start.canvasId === canvas?.id ? start.placementId : null,
     bookmarkedPlacementIds: new Set(bookmarks.flatMap((bookmark) =>
@@ -132,12 +133,6 @@ export function CanvasView() {
     areas: canvas.areas,
     placements: canvas.placements,
   } : null, [canvas?.areas, canvas?.placements]);
-  const edgeCanvas = useMemo(() => canvas ? {
-    areas: canvas.areas,
-    edges: canvas.edges,
-    placements: canvas.placements,
-  } : null, [canvas?.areas, canvas?.edges, canvas?.placements]);
-
   const domainNodes = useMemo(
     () => nodeCanvas ? toFlowNodes(
       nodeCanvas,
@@ -154,20 +149,18 @@ export function CanvasView() {
     [cardStatus, cards, deferredQuery, effectiveFilterBehavior, effectiveTags, nodeCanvas, resizePreview, selectedAreaId, selectedPlacementIds, tagFilterMode],
   );
   const nodes = domainNodes;
-  const dimmedPlacementIds = useMemo(() => new Set(domainNodes.flatMap((node) =>
-    node.type === "card" && node.className?.includes("is-dimmed") ? [node.id] : [])), [domainNodes]);
   const edges = useMemo(
-    () => edgeCanvas ? toFlowEdges(
-      edgeCanvas,
-      selectedEdgeId,
-      effectiveFilterBehavior === "hide"
-        ? new Set(domainNodes.filter((node) => node.type === "card").map((node) => node.id))
-        : undefined,
-      resizePreview,
-      mutedCardIds,
-      dimmedPlacementIds,
-    ) : [],
-    [dimmedPlacementIds, domainNodes, edgeCanvas, effectiveFilterBehavior, mutedCardIds, resizePreview, selectedEdgeId],
+    () => {
+      if (!canvas) return [];
+      const projection = projectFlowEdges(
+        canvas, cards, selectedEdgeId, deferredQuery, effectiveTags,
+        tagFilterMode, effectiveFilterBehavior, resizePreview, edgeProjectionRef.current,
+      );
+      edgeProjectionRef.current = projection;
+      return projection.edges;
+    },
+    [canvas?.id, canvas?.areas, canvas?.edges, canvas?.placements, cards, selectedEdgeId,
+      deferredQuery, effectiveTags, tagFilterMode, effectiveFilterBehavior, resizePreview],
   );
   const renderedNodes = useMemo(
     () => nodes.map((node) => node.type === "area" && node.id === highlightAreaId
@@ -225,62 +218,42 @@ export function CanvasView() {
     if (!event.ctrlKey && !event.metaKey) useAppStore.getState().setSelection({ type: "edge", id: edge.id });
   }, []);
 
-  const findDropArea = useCallback((node: ShepherdFlowNode): string | null => {
+  const previewForDrag = useCallback((node: ShepherdFlowNode): DragPreview | null => {
     if (node.type !== "card") return null;
     const currentCanvas = canvasRef.current;
     if (!currentCanvas) return null;
-    const placement = currentCanvas.placements.find((item) => item.id === node.id);
-    if (!placement) return null;
-    const centerX = node.position.x + placement.size.width / 2;
-    const centerY = node.position.y + placement.size.height / 2;
-    const candidate = currentCanvas.areas.find((area) =>
-      !area.collapsed && containsPoint(getAreaBounds(area, currentCanvas.placements), centerX, centerY, 20),
-    );
-    if (candidate) return candidate.id;
-    if (placement.areaId) {
-      const current = currentCanvas.areas.find((area) => area.id === placement.areaId);
-      if (current && containsPoint(getAreaBounds(current, currentCanvas.placements), centerX, centerY, 56)) {
-        return current.id;
-      }
-    }
-    return "";
+    const cached = dragPreviewRef.current;
+    if (cached?.canvasId === currentCanvas.id && cached.nodeId === node.id &&
+        cached.areas === currentCanvas.areas && cached.placements === currentCanvas.placements) return cached;
+    const preview = createDragPreview(currentCanvas, nodesRef.current, node.id);
+    dragPreviewRef.current = preview;
+    return preview;
   }, []);
 
-  const updateGuides = useCallback((node: ShepherdFlowNode) => {
-    if (node.type !== "card") return;
-    const width = node.width ?? CARD_WIDTH_FALLBACK;
-    const height = node.height ?? CARD_HEIGHT_FALLBACK;
-    const xCandidates = [node.position.x, node.position.x + width / 2, node.position.x + width];
-    const yCandidates = [node.position.y, node.position.y + height / 2, node.position.y + height];
-    let guideX: number | undefined;
-    let guideY: number | undefined;
-    for (const other of nodesRef.current) {
-      if (other.id === node.id || other.type !== "card") continue;
-      const otherWidth = other.width ?? CARD_WIDTH_FALLBACK;
-      const otherHeight = other.height ?? CARD_HEIGHT_FALLBACK;
-      const otherX = [other.position.x, other.position.x + otherWidth / 2, other.position.x + otherWidth];
-      const otherY = [other.position.y, other.position.y + otherHeight / 2, other.position.y + otherHeight];
-      guideX ??= otherX.find((value) => xCandidates.some((candidate) => Math.abs(candidate - value) <= ALIGNMENT_THRESHOLD));
-      guideY ??= otherY.find((value) => yCandidates.some((candidate) => Math.abs(candidate - value) <= ALIGNMENT_THRESHOLD));
-    }
+  const handleNodeDragStart = useCallback<OnNodeDrag<ShepherdFlowNode>>((_, node) => {
+    if (node.type === "card") previewForDrag(node);
+  }, [previewForDrag]);
+
+  const handleNodeDrag = useCallback<OnNodeDrag<ShepherdFlowNode>>((_, node) => {
+    const preview = previewForDrag(node);
+    if (!preview) return;
+    const { x: guideX, y: guideY } = dragGuides(preview, node);
     setGuides((current) => current.x === guideX && current.y === guideY
       ? current
       : { x: guideX, y: guideY });
-  }, []);
+    const areaId = dragDropArea(preview, node);
+    setHighlightAreaId((current) => current === (areaId || null) ? current : (areaId || null));
+  }, [previewForDrag]);
 
   const handleSelection = useCallback(({ nodes: selectedNodes, edges: selectedEdges }: OnSelectionChangeParams) => {
     selectionRef.current = selectionFromFlowElements(selectedNodes as ShepherdFlowNode[], selectedEdges);
   }, []);
 
-  const handleNodeDrag = useCallback<OnNodeDrag<ShepherdFlowNode>>((_, node) => {
-    updateGuides(node);
-    const areaId = findDropArea(node);
-    setHighlightAreaId((current) => current === (areaId || null) ? current : (areaId || null));
-  }, [findDropArea, updateGuides]);
-
   const handleNodeDragStop = useCallback<OnNodeDrag<ShepherdFlowNode>>((_, node) => {
     setGuides({});
     setHighlightAreaId(null);
+    const preview = previewForDrag(node);
+    dragPreviewRef.current = null;
     const currentCanvas = canvasRef.current;
     if (!currentCanvas) return;
     if (node.type === "area") {
@@ -298,10 +271,10 @@ export function CanvasView() {
       const position = dragPositionsRef.current.get(id) ?? local?.position;
       return position ? [{ id, position }] : [];
     });
-    const dropArea = selectedIds.length === 1 ? findDropArea(node) : null;
+    const dropArea = selectedIds.length === 1 && preview ? dragDropArea(preview, node) : null;
     movePlacements(moves, selectedIds.length === 1 ? (dropArea || null) : undefined);
     dragPositionsRef.current.clear();
-  }, [findDropArea, moveArea, movePlacements]);
+  }, [previewForDrag, moveArea, movePlacements]);
 
   const handleNodeDoubleClick = useCallback((event: React.MouseEvent, node: ShepherdFlowNode) => {
     if (event.target instanceof Element && event.target.closest(".react-flow__handle")) return;
@@ -490,6 +463,7 @@ export function CanvasView() {
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
         onEdgeClick={handleEdgeClick}
+        onNodeDragStart={handleNodeDragStart}
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onNodeDoubleClick={handleNodeDoubleClick}
